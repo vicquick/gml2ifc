@@ -544,7 +544,11 @@ def _get_or_create_surface_style(ifc_file, style_cache, surface_type, color_map)
     r, g, b = hex_to_rgb01(hex_color)
 
     colour_rgb = ifc_file.createIfcColourRgb(None, r, g, b)
-    rendering = ifc_file.createIfcSurfaceStyleShading(SurfaceColour=colour_rgb)
+    rendering = ifc_file.createIfcSurfaceStyleRendering(
+        SurfaceColour=colour_rgb,
+        Transparency=0.0,
+        ReflectanceMethod='NOTDEFINED',
+    )
     style = ifc_file.createIfcSurfaceStyle(
         Name=surface_type,
         Side='BOTH',
