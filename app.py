@@ -13,10 +13,17 @@ import zipfile
 from gml_converter import (
     convert_gml_to_ifc_bytes, convert_gml_files_merged,
     CRS_OPTIONS, DEFAULT_SURFACE_COLORS, detect_surface_types,
+    resolve_crs,
 )
 from tif_converter import (
     extract_tif_metadata,
-    convert_tif_to_shapefile
+    convert_tif_to_shapefile,
+    suggest_contour_interval,
+)
+from wms_fetcher import (
+    get_wms_layers,
+    fetch_wms_elevation_tif,
+    extract_shapefile_bbox
 )
 
 # ============================================================================
@@ -386,47 +393,176 @@ with tab1:
 # ============================================================================
 with tab2:
     st.subheader("TIF to 3D Contour Shapefile")
-    st.markdown("Generate 3D contour polylines from elevation GeoTIFF (DGM1) and export as Shapefile")
-    
-    # FILE UPLOAD
-    st.subheader("📂 Upload TIF File")
-    
-    uploaded_tif = st.file_uploader(
-        "Select a GeoTIFF elevation file",
-        type=['tif', 'tiff', 'TIF', 'TIFF'],
-        help="Upload a GeoTIFF file containing elevation data (e.g., DGM1)",
-        key="tif_uploader"
+    st.markdown("Generate 3D contour polylines from elevation data and export as Shapefile")
+
+    # Input mode selector
+    input_mode = st.radio(
+        "Input Source",
+        ["Upload TIF", "Fetch from WMS"],
+        horizontal=True,
+        key="tif_input_mode"
     )
-    
-    if uploaded_tif:
-        # Read TIF bytes
-        tif_bytes = uploaded_tif.read()
+
+    # Clear WMS session state when switching to Upload mode
+    if input_mode == "Upload TIF":
+        for key in ['wms_layers', 'wms_tif_bytes', 'wms_source_filename']:
+            if key in st.session_state:
+                del st.session_state[key]
+
+    tif_bytes = None
+    source_filename = None
+
+    # ── UPLOAD TIF BRANCH ──
+    if input_mode == "Upload TIF":
+        st.subheader("Upload TIF File")
+
+        uploaded_tif = st.file_uploader(
+            "Select a GeoTIFF elevation file",
+            type=['tif', 'tiff', 'TIF', 'TIFF'],
+            help="Upload a GeoTIFF file containing elevation data (e.g., DGM1)",
+            key="tif_uploader"
+        )
+
+        if uploaded_tif:
+            tif_bytes = uploaded_tif.read()
+            source_filename = uploaded_tif.name
+
+    # ── FETCH FROM WMS BRANCH ──
+    else:
+        st.subheader("Fetch Elevation from WMS")
+
+        wms_url = st.text_input(
+            "WMS URL",
+            placeholder="https://example.com/wms",
+            help="Base URL of the WMS service (without query parameters)",
+            key="wms_url"
+        )
+
+        # Load Layers button
+        if wms_url and st.button("Load Layers", key="wms_load_layers"):
+            with st.spinner("Fetching WMS capabilities..."):
+                caps_result = get_wms_layers(wms_url)
+            if caps_result['success']:
+                if caps_result['layers']:
+                    st.session_state['wms_layers'] = caps_result['layers']
+                    st.success(f"Found {len(caps_result['layers'])} layer(s)")
+                else:
+                    st.warning("WMS returned no layers")
+                    st.session_state.pop('wms_layers', None)
+            else:
+                st.error(f"Failed to load layers: {caps_result['error']}")
+                st.session_state.pop('wms_layers', None)
+
+        # Layer selector (persisted in session state)
+        if 'wms_layers' in st.session_state and st.session_state['wms_layers']:
+            layers = st.session_state['wms_layers']
+            layer_options = [f"{l['name']} — {l['title']}" for l in layers]
+
+            selected_layer_label = st.selectbox(
+                "Layer",
+                options=layer_options,
+                key="wms_layer_select"
+            )
+            selected_layer_name = layers[layer_options.index(selected_layer_label)]['name']
+
+            st.divider()
+
+            # Shapefile upload for bounding box
+            st.markdown("**Bounding Box from Shapefile:**")
+            bbox_shp = st.file_uploader(
+                "Upload a shapefile (ZIP) to define the area",
+                type=['zip'],
+                help="ZIP containing a Shapefile (.shp/.shx/.dbf/.prj). The bounding box of all features will be used.",
+                key="wms_bbox_shp"
+            )
+
+            if bbox_shp:
+                shp_bytes = bbox_shp.read()
+                bbox_result = extract_shapefile_bbox(shp_bytes)
+
+                if bbox_result['success']:
+                    bbox = bbox_result['bbox']
+                    epsg_code = bbox_result['epsg_code']
+
+                    st.success(f"Bounding box extracted from {bbox_result['num_features']} feature(s)")
+                    st.caption(
+                        f"MinX: {bbox[0]:.2f} | MinY: {bbox[1]:.2f} | "
+                        f"MaxX: {bbox[2]:.2f} | MaxY: {bbox[3]:.2f}"
+                    )
+
+                    # Handle missing CRS
+                    if epsg_code is None:
+                        st.warning("Shapefile has no CRS. Please enter the EPSG code manually.")
+                        epsg_code = st.number_input(
+                            "EPSG Code",
+                            min_value=1,
+                            value=25832,
+                            step=1,
+                            help="EPSG code for the shapefile coordinate system (e.g., 25832 for ETRS89 / UTM zone 32N)",
+                            key="wms_manual_epsg"
+                        )
+                    else:
+                        st.caption(f"CRS: EPSG:{epsg_code}")
+
+                    st.divider()
+
+                    # Fetch button
+                    if st.button("Fetch Elevation", type="primary", use_container_width=True, key="wms_fetch"):
+                        with st.spinner("Fetching elevation data from WMS..."):
+                            fetch_result = fetch_wms_elevation_tif(
+                                wms_url=wms_url,
+                                layer_name=selected_layer_name,
+                                bbox=bbox,
+                                crs_epsg=int(epsg_code),
+                            )
+
+                        if fetch_result['success']:
+                            st.session_state['wms_tif_bytes'] = fetch_result['tif_bytes']
+                            st.session_state['wms_source_filename'] = f"wms_{selected_layer_name}.tif"
+                            st.success(
+                                f"Fetched {len(fetch_result['tif_bytes']) / 1024:.0f} KB "
+                                f"({fetch_result['width']}x{fetch_result['height']} px)"
+                            )
+                        else:
+                            st.error(f"Failed to fetch elevation: {fetch_result['error']}")
+                            st.session_state.pop('wms_tif_bytes', None)
+
+                else:
+                    st.error(f"Failed to read shapefile: {bbox_result['error']}")
+
+        # Use WMS result if available
+        if 'wms_tif_bytes' in st.session_state:
+            tif_bytes = st.session_state['wms_tif_bytes']
+            source_filename = st.session_state.get('wms_source_filename', 'wms_elevation.tif')
+
+    # ── SHARED SECTION: metadata, settings, generation ──
+    if tif_bytes is not None:
         file_size = len(tif_bytes) / (1024 * 1024)  # MB
-        
+
         st.divider()
-        
+
         # Extract and display metadata
         with st.spinner("Analyzing GeoTIFF..."):
             metadata_result = extract_tif_metadata(tif_bytes)
-        
+
         if metadata_result['success']:
-            st.success("✓ TIF file loaded successfully")
-            
+            st.success("TIF data loaded successfully")
+
             # Display metadata
-            with st.expander("📊 TIF Metadata", expanded=True):
+            with st.expander("TIF Metadata", expanded=True):
                 col1, col2, col3 = st.columns(3)
-                
+
                 with col1:
                     st.metric("Resolution", f"{metadata_result['resolution']:.3f} m")
                     st.metric("Width", f"{metadata_result['width']} px")
-                
+
                 with col2:
                     st.metric("EPSG Code", metadata_result['epsg_code'] or "Unknown")
                     st.metric("Height", f"{metadata_result['height']} px")
-                
+
                 with col3:
                     st.metric("File Size", f"{file_size:.1f} MB")
-                
+
                 st.markdown("**Elevation Range:**")
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -435,40 +571,38 @@ with tab2:
                     st.metric("Mean", f"{metadata_result['elevation_range']['mean']:.2f} m")
                 with col3:
                     st.metric("Max", f"{metadata_result['elevation_range']['max']:.2f} m")
-                
+
                 st.markdown("**Bounds:**")
                 bounds = metadata_result['bounds']
                 st.caption(f"Left: {bounds['left']:.2f} | Bottom: {bounds['bottom']:.2f} | Right: {bounds['right']:.2f} | Top: {bounds['top']:.2f}")
-            
+
             st.divider()
-            
+
             # SETTINGS
-            st.subheader("⚙️ Contour Generation Settings")
-            
+            st.subheader("Contour Generation Settings")
+
+            # Smart interval suggestion based on resolution + elevation range
+            suggested_interval = suggest_contour_interval(
+                metadata_result['resolution'],
+                metadata_result['elevation_range']['min'],
+                metadata_result['elevation_range']['max'],
+            )
+            elev_span = metadata_result['elevation_range']['max'] - metadata_result['elevation_range']['min']
+            est_contours = int(elev_span / suggested_interval) if suggested_interval > 0 else 0
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
-                # Auto-calculate suggested interval
-                res = metadata_result['resolution']
-                if res < 1:
-                    suggested_interval = 0.5
-                elif res < 5:
-                    suggested_interval = 1.0
-                elif res < 10:
-                    suggested_interval = 5.0
-                else:
-                    suggested_interval = 10.0
-                
                 interval = st.number_input(
                     "Contour Interval (m)",
                     min_value=0.1,
                     max_value=100.0,
                     value=float(suggested_interval),
                     step=0.5,
-                    help=f"Vertical spacing between contour lines (suggested: {suggested_interval}m based on resolution)",
+                    help=f"Auto-suggested: {suggested_interval}m (~{est_contours} contours for {elev_span:.1f}m range at {metadata_result['resolution']:.2f}m resolution)",
                     key="contour_interval"
                 )
-            
+
             with col2:
                 use_elevation_filter = st.checkbox(
                     "Filter Elevation Range",
@@ -476,7 +610,7 @@ with tab2:
                     help="Limit contour generation to specific elevation range",
                     key="use_elevation_filter"
                 )
-            
+
             if use_elevation_filter:
                 col1, col2 = st.columns(2)
                 with col1:
@@ -498,10 +632,26 @@ with tab2:
             else:
                 min_elev = None
                 max_elev = None
-            
+
+            # Output CRS selector (same options as GML pipeline)
+            st.markdown("**Output CRS:**")
+            _contour_crs_labels = [f"{code} — {name}" for code, name in CRS_OPTIONS.items()]
+            output_crs_label = st.selectbox(
+                "Output coordinate system",
+                ["Same as input"] + _contour_crs_labels,
+                index=0,
+                help=f"Input CRS: EPSG:{metadata_result['epsg_code'] or '?'}. Choose a different output CRS to reproject contours.",
+                key="output_crs"
+            )
+            if output_crs_label == "Same as input":
+                output_crs = None
+            else:
+                output_crs_key = output_crs_label.split(" — ")[0]  # e.g. "EPSG:25832" or "LS320"
+                output_crs = resolve_crs(output_crs_key)
+
             # Simplification settings
             st.markdown("**Simplification Algorithm:**")
-            
+
             simplification_method = st.selectbox(
                 "Method",
                 options=['none', 'douglas-peucker', 'chaikin'],
@@ -513,9 +663,9 @@ with tab2:
                 help="Choose algorithm to simplify contour lines",
                 key="simplification_method"
             )
-            
+
             simplification_params = {}
-            
+
             if simplification_method == 'douglas-peucker':
                 tolerance = st.slider(
                     "Tolerance (m)",
@@ -527,7 +677,7 @@ with tab2:
                     key="dp_tolerance"
                 )
                 simplification_params['tolerance'] = tolerance
-            
+
             elif simplification_method == 'chaikin':
                 iterations = st.slider(
                     "Iterations",
@@ -539,55 +689,62 @@ with tab2:
                     key="chaikin_iterations"
                 )
                 simplification_params['iterations'] = iterations
-            
+
             st.divider()
-            
+
             # GENERATE BUTTON
-            if st.button("🔄 Generate Contours", type="primary", use_container_width=True):
+            if st.button("Generate Contours", type="primary", use_container_width=True):
                 with st.spinner("Generating contours... This may take a while for large files."):
                     result = convert_tif_to_shapefile(
                         tif_bytes=tif_bytes,
-                        filename=uploaded_tif.name,
+                        filename=source_filename,
                         interval=interval,
                         min_elevation=min_elev,
                         max_elevation=max_elev,
                         simplification_method=simplification_method,
-                        simplification_params=simplification_params
+                        simplification_params=simplification_params,
+                        output_crs=output_crs,
                     )
-                
+
                 if result['success']:
-                    st.success(f"✓ Successfully generated {result['metadata']['num_contours']} contour lines!")
-                    
+                    st.success(f"Successfully generated {result['metadata']['num_contours']} contour lines!")
+
                     # Display generation info
-                    with st.expander("📊 Generation Details", expanded=True):
+                    with st.expander("Generation Details", expanded=True):
                         col1, col2, col3 = st.columns(3)
-                        
+
                         with col1:
                             st.metric("Contours", result['metadata']['num_contours'])
                             st.metric("Interval", f"{result['metadata']['interval']} m")
-                        
+
                         with col2:
-                            st.metric("EPSG Code", result['metadata']['epsg_code'] or "Unknown")
+                            out_crs = result['metadata'].get('output_crs_name')
+                            src_epsg = result['metadata']['epsg_code']
+                            if out_crs and out_crs != str(src_epsg):
+                                st.metric("Output CRS", out_crs)
+                                st.caption(f"(reprojected from EPSG:{src_epsg})")
+                            else:
+                                st.metric("EPSG Code", src_epsg or "Unknown")
                             st.metric("Resolution", f"{result['metadata']['resolution']:.3f} m")
-                        
+
                         with col3:
                             st.metric("Simplification", result['metadata']['simplification'].replace('-', ' ').title())
-                        
+
                         st.markdown("**Contour Levels:**")
                         levels = result['metadata']['contour_levels']
                         st.caption(f"{len(levels)} levels from {min(levels):.1f}m to {max(levels):.1f}m")
-                    
+
                     st.divider()
-                    
+
                     # DOWNLOAD SECTION
-                    st.subheader("📥 Download Shapefile")
-                    
+                    st.subheader("Download Shapefile")
+
                     zip_size_kb = len(result['zip_bytes']) / 1024
-                    
+
                     col1, col2 = st.columns([3, 1])
                     with col1:
                         st.download_button(
-                            label=f"⬇️ Download {result['filename']}",
+                            label=f"Download {result['filename']}",
                             data=result['zip_bytes'],
                             file_name=result['filename'],
                             mime="application/zip",
@@ -596,37 +753,37 @@ with tab2:
                         )
                     with col2:
                         st.metric("Size", f"{zip_size_kb:.1f} KB")
-                    
-                    st.info("💡 The ZIP contains all shapefile components (.shp, .shx, .dbf, .prj). Extract all files to the same directory to use the shapefile.")
-                
+
+                    st.info("The ZIP contains all shapefile components (.shp, .shx, .dbf, .prj). Extract all files to the same directory to use the shapefile.")
+
                 else:
-                    st.error(f"✗ Failed to generate contours: {result.get('error', 'Unknown error')}")
-        
+                    st.error(f"Failed to generate contours: {result.get('error', 'Unknown error')}")
+
         else:
-            st.error(f"✗ Failed to read TIF file: {metadata_result.get('error', 'Unknown error')}")
-    
-    else:
-        st.info("👆 Upload a GeoTIFF file to get started")
-        
-        with st.expander("ℹ️ About this converter"):
+            st.error(f"Failed to read TIF file: {metadata_result.get('error', 'Unknown error')}")
+
+    elif input_mode == "Upload TIF":
+        st.info("Upload a GeoTIFF file to get started")
+
+        with st.expander("About this converter"):
             st.markdown("""
             This tool generates 3D contour polylines from elevation GeoTIFF files:
-            
+
             **Features:**
             - Automatic resolution detection and interval suggestion
             - Support for DGM1 and other elevation rasters
             - 3D polylines (PolyLineZ) with elevation as Z coordinate
             - Multiple simplification algorithms
             - EPSG coordinate reference system preservation
-            
+
             **Simplification Algorithms:**
             - **Douglas-Peucker**: Reduces number of points while preserving shape
             - **Chaikin**: Smooths corners and curves through iterative refinement
-            
+
             **Input Requirements:**
             - GeoTIFF with elevation data (single band)
             - Coordinate reference system (CRS) metadata
-            
+
             **Output:**
             - ESRI Shapefile (as ZIP)
             - 3D polyline features (PolyLineZ)
