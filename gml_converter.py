@@ -651,6 +651,36 @@ def create_building_element_proxy(ifc_file, site, context, polygons, name="GML E
         raise Exception(f"Error creating IFC element: {e}")
 
 
+def create_building_split_by_surface(ifc_file, site, context, bldg, color_map, style_cache):
+    """Create separate IfcBuildingElementProxy elements per surface type for one building.
+
+    Returns the number of elements created.
+    """
+    from collections import defaultdict
+
+    # Group polygon indices by surface type
+    groups = defaultdict(lambda: {'polygons': [], 'stypes': []})
+    for i, polygon_coords in enumerate(bldg['polygons']):
+        stype = bldg['surface_types'][i] if i < len(bldg.get('surface_types', [])) else 'unknown'
+        groups[stype]['polygons'].append(polygon_coords)
+        groups[stype]['stypes'].append(stype)
+
+    count = 0
+    base_name = bldg['name']
+    for stype, data in groups.items():
+        label = stype.replace('Surface', '')
+        elem_name = f"{base_name}_{label}" if base_name else label
+        element = create_building_element_proxy(
+            ifc_file, site, context, data['polygons'], name=elem_name,
+            surface_types=data['stypes'],
+            color_map=color_map,
+            style_cache=style_cache,
+        )
+        if element:
+            count += 1
+    return count
+
+
 # ============================================================================
 # MAIN CONVERSION FUNCTION
 # ============================================================================
@@ -668,7 +698,7 @@ def detect_surface_types(gml_contents):
 def convert_gml_to_ifc_bytes(gml_content, filename, default_epsg=25832,
                               use_map_conversion=False, boundary_polygon=None,
                               input_crs_key=None, output_crs_key=None,
-                              color_map=None):
+                              color_map=None, split_by_surface=False):
     """
     Convert GML content to IFC and return as bytes with metadata.
 
@@ -743,20 +773,27 @@ def convert_gml_to_ifc_bytes(gml_content, filename, default_epsg=25832,
         # Create IFC file
         ifc_file, site, context = create_ifc_file(ifc_epsg_num, use_map_conversion)
 
-        # Create one IfcBuildingElementProxy per building
+        # Create IFC elements
         element_stem = Path(filename).stem
         element_count = 0
-        style_cache = {}  # shared across buildings to reuse IFC style entities
+        style_cache = {}
         for bldg in buildings:
-            name = bldg['name'] if len(buildings) > 1 else element_stem
-            element = create_building_element_proxy(
-                ifc_file, site, context, bldg['polygons'], name=name,
-                surface_types=bldg.get('surface_types'),
-                color_map=color_map,
-                style_cache=style_cache,
-            )
-            if element:
-                element_count += 1
+            bldg_name = bldg['name'] if len(buildings) > 1 else element_stem
+            bldg['name'] = bldg_name  # ensure name is set for split helper
+
+            if split_by_surface and color_map:
+                element_count += create_building_split_by_surface(
+                    ifc_file, site, context, bldg, color_map, style_cache
+                )
+            else:
+                element = create_building_element_proxy(
+                    ifc_file, site, context, bldg['polygons'], name=bldg_name,
+                    surface_types=bldg.get('surface_types'),
+                    color_map=color_map,
+                    style_cache=style_cache,
+                )
+                if element:
+                    element_count += 1
 
         if element_count == 0:
             return {
@@ -799,7 +836,7 @@ def convert_gml_to_ifc_bytes(gml_content, filename, default_epsg=25832,
 def convert_gml_files_merged(gml_file_list, use_map_conversion=False,
                               boundary_polygon=None, input_crs_key=None,
                               output_crs_key=None, color_map=None,
-                              default_epsg=25832):
+                              default_epsg=25832, split_by_surface=False):
     """Convert multiple GML files into a single merged IFC.
 
     Args:
@@ -881,14 +918,19 @@ def convert_gml_files_merged(gml_file_list, use_map_conversion=False,
         style_cache = {}
         element_count = 0
         for bldg in all_buildings:
-            element = create_building_element_proxy(
-                ifc_file, site, context, bldg['polygons'], name=bldg['name'],
-                surface_types=bldg.get('surface_types'),
-                color_map=color_map,
-                style_cache=style_cache,
-            )
-            if element:
-                element_count += 1
+            if split_by_surface and color_map:
+                element_count += create_building_split_by_surface(
+                    ifc_file, site, context, bldg, color_map, style_cache
+                )
+            else:
+                element = create_building_element_proxy(
+                    ifc_file, site, context, bldg['polygons'], name=bldg['name'],
+                    surface_types=bldg.get('surface_types'),
+                    color_map=color_map,
+                    style_cache=style_cache,
+                )
+                if element:
+                    element_count += 1
 
         if element_count == 0:
             return {'success': False, 'error': 'Failed to create IFC geometry'}

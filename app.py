@@ -137,6 +137,7 @@ with tab1:
         )
 
         color_map = None
+        split_by_surface = False
         if enable_colors:
             st.caption("Customize colors per surface type:")
             color_map = {}
@@ -144,11 +145,16 @@ with tab1:
                 if stype == 'unknown':
                     label = "Other / unclassified"
                 else:
-                    # Add spaces before capitals for readability
                     label = stype.replace('Surface', ' Surface')
                 color_map[stype] = st.color_picker(
                     label, value=default_hex, key=f"color_{stype}"
                 )
+            split_by_surface = st.checkbox(
+                "Split elements by surface type (Vectorworks compatibility)",
+                value=False,
+                help="Creates separate IFC elements per surface type (Roof, Wall, Ground) so each gets its own color in Vectorworks",
+                key="gml_split_surface"
+            )
 
     st.divider()
 
@@ -187,6 +193,7 @@ with tab1:
                         input_crs_key=input_crs_key,
                         output_crs_key=output_crs_key,
                         color_map=color_map,
+                        split_by_surface=split_by_surface,
                     )
 
                     if result['success']:
@@ -248,6 +255,7 @@ with tab1:
                                 input_crs_key=input_crs_key,
                                 output_crs_key=output_crs_key,
                                 color_map=color_map,
+                                split_by_surface=split_by_surface,
                             )
 
                             if result['success']:
