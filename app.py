@@ -10,7 +10,10 @@ import io
 import zipfile
 
 # Import converter functions
-from gml_converter import convert_gml_to_ifc_bytes
+from gml_converter import (
+    convert_gml_to_ifc_bytes, convert_gml_files_merged,
+    CRS_OPTIONS, DEFAULT_SURFACE_COLORS, detect_surface_types,
+)
 from tif_converter import (
     extract_tif_metadata,
     convert_tif_to_shapefile
@@ -29,7 +32,7 @@ st.set_page_config(
 # HEADER
 # ============================================================================
 st.title("🗺️ GeoData Converter")
-st.caption("powered by Streamlit + IfcOpenShell + GDAL")
+st.caption("powered by Streamlit + IfcOpenShell + pyproj")
 st.markdown("Convert geospatial data between formats")
 
 st.divider()
@@ -54,15 +57,98 @@ with tab1:
             help="Enable IfcMapConversion for georeferencing (may cause coordinate issues in some viewers)",
             key="gml_map_conversion"
         )
-        
-        default_epsg = st.number_input(
-            "Default EPSG Code",
-            value=25832,
-            min_value=1,
-            max_value=99999,
-            help="Default EPSG code to use if not found in GML file (EPSG:25832 = ETRS89 / UTM zone 32N)",
-            key="gml_epsg"
+
+        # CRS selectors
+        crs_labels = [f"{code} — {name}" for code, name in CRS_OPTIONS.items()]
+
+        input_crs_label = st.selectbox(
+            "Input CRS",
+            ["Auto-detect from GML"] + crs_labels,
+            index=0,
+            help="Override CRS if GML file has no srsName attribute",
+            key="gml_input_crs"
         )
+        input_crs_key = None
+        if input_crs_label != "Auto-detect from GML":
+            input_crs_key = input_crs_label.split(" — ")[0]
+
+        output_crs_label = st.selectbox(
+            "Output CRS",
+            crs_labels,
+            index=0,  # default EPSG:25832
+            help="Target coordinate reference system for IFC output",
+            key="gml_output_crs"
+        )
+        output_crs_key = output_crs_label.split(" — ")[0]
+
+        st.divider()
+
+        # Boundary crop uploader
+        boundary_file = st.file_uploader(
+            "Upload boundary SHP (optional — crop buildings to area)",
+            type=['zip'],
+            help="ZIP containing a Shapefile (.shp/.shx/.dbf/.prj) to crop buildings to a bounding area",
+            key="gml_boundary"
+        )
+
+        boundary_polygon = None
+        if boundary_file:
+            try:
+                import geopandas as gpd
+                import tempfile as _tmpmod
+                import zipfile as _zipmod
+
+                boundary_bytes = boundary_file.read()
+                with _tmpmod.TemporaryDirectory() as tmpdir:
+                    zip_path = Path(tmpdir) / "boundary.zip"
+                    zip_path.write_bytes(boundary_bytes)
+
+                    with _zipmod.ZipFile(zip_path, 'r') as zf:
+                        zf.extractall(tmpdir)
+
+                    shp_files = list(Path(tmpdir).glob("**/*.shp"))
+                    if not shp_files:
+                        st.error("No .shp file found in the uploaded ZIP")
+                    else:
+                        gdf = gpd.read_file(shp_files[0])
+                        boundary_polygon = gdf.union_all()
+                        st.success(f"Boundary loaded: {len(gdf)} feature(s)")
+            except Exception as e:
+                st.error(f"Error reading boundary SHP: {e}")
+
+        st.divider()
+
+        # Merge option
+        merge_files = st.checkbox(
+            "Merge all GML files into single IFC",
+            value=False,
+            help="Combine all uploaded GML files into one merged IFC instead of separate files",
+            key="gml_merge"
+        )
+
+        st.divider()
+
+        # Color by surface type
+        enable_colors = st.checkbox(
+            "Color by surface type",
+            value=False,
+            help="Apply colors to roof, wall, and ground surfaces (CityGML LoD2+)",
+            key="gml_enable_colors"
+        )
+
+        color_map = None
+        if enable_colors:
+            st.caption("Customize colors per surface type:")
+            color_map = {}
+            for stype, default_hex in DEFAULT_SURFACE_COLORS.items():
+                if stype == 'unknown':
+                    label = "Other / unclassified"
+                else:
+                    # Add spaces before capitals for readability
+                    label = stype.replace('Surface', ' Surface')
+                color_map[stype] = st.color_picker(
+                    label, value=default_hex, key=f"color_{stype}"
+                )
 
     st.divider()
 
@@ -81,66 +167,122 @@ with tab1:
     if uploaded_files:
         st.divider()
         st.subheader(f"🔄 Processing {len(uploaded_files)} file(s)")
-        
+
         # Store converted files
         converted_files = {}
-        
-        for idx, uploaded_file in enumerate(uploaded_files, 1):
-            with st.container():
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    st.write(f"**{idx}. {uploaded_file.name}**")
-                
-                with col2:
-                    file_size = len(uploaded_file.getvalue()) / 1024  # KB
-                    st.caption(f"{file_size:.1f} KB")
-                
-                # Progress indicator
-                info_placeholder = st.empty()
-                
-                try:
-                    with st.spinner(f"Converting..."):
-                        # Read file content
-                        gml_content = uploaded_file.read()
-                        
-                        # Convert to IFC
-                        result = convert_gml_to_ifc_bytes(
-                            gml_content=gml_content,
-                            filename=uploaded_file.name,
-                            default_epsg=default_epsg,
-                            use_map_conversion=use_map_conversion
-                        )
-                        
-                        if result['success']:
-                            output_filename = Path(uploaded_file.name).stem + ".ifc"
-                            converted_files[output_filename] = result['ifc_bytes']
-                            
-                            # Show success info
-                            info_placeholder.success(
-                                f"✓ Converted • {result['num_polygons']} polygon(s) • EPSG:{result['epsg_code']}"
-                            )
-                            
-                            # Show coordinate bounds in expandable section
-                            if result.get('bounds'):
-                                bounds = result['bounds']
-                                with st.expander("📍 Coordinate Bounds", expanded=False):
-                                    col_min, col_max = st.columns(2)
-                                    with col_min:
-                                        st.metric("Min X", f"{bounds['min'][0]:.2f}")
-                                        st.metric("Min Y", f"{bounds['min'][1]:.2f}")
-                                        st.metric("Min Z", f"{bounds['min'][2]:.2f}")
-                                    with col_max:
-                                        st.metric("Max X", f"{bounds['max'][0]:.2f}")
-                                        st.metric("Max Y", f"{bounds['max'][1]:.2f}")
-                                        st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+
+        if merge_files and len(uploaded_files) > 1:
+            # ── MERGED MODE ──
+            info_placeholder = st.empty()
+            try:
+                with st.spinner("Merging and converting..."):
+                    gml_file_list = []
+                    for uf in uploaded_files:
+                        gml_file_list.append((uf.name, uf.read()))
+
+                    result = convert_gml_files_merged(
+                        gml_file_list=gml_file_list,
+                        use_map_conversion=use_map_conversion,
+                        boundary_polygon=boundary_polygon,
+                        input_crs_key=input_crs_key,
+                        output_crs_key=output_crs_key,
+                        color_map=color_map,
+                    )
+
+                    if result['success']:
+                        output_filename = "merged_output.ifc"
+                        converted_files[output_filename] = result['ifc_bytes']
+
+                        msg_parts = ["✓ Merged"]
+                        if result.get('kept_buildings', 0) < result.get('total_buildings', 0):
+                            msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
                         else:
-                            info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
-                    
-                except Exception as e:
-                    info_placeholder.error(f"✗ Error: {str(e)}")
-            
+                            msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
+                        msg_parts.append(f"{result['num_polygons']} polygon(s)")
+                        msg_parts.append(f"{result['epsg_code']}")
+                        info_placeholder.success(" • ".join(msg_parts))
+
+                        if result.get('bounds'):
+                            bounds = result['bounds']
+                            with st.expander("📍 Coordinate Bounds", expanded=False):
+                                col_min, col_max = st.columns(2)
+                                with col_min:
+                                    st.metric("Min X", f"{bounds['min'][0]:.2f}")
+                                    st.metric("Min Y", f"{bounds['min'][1]:.2f}")
+                                    st.metric("Min Z", f"{bounds['min'][2]:.2f}")
+                                with col_max:
+                                    st.metric("Max X", f"{bounds['max'][0]:.2f}")
+                                    st.metric("Max Y", f"{bounds['max'][1]:.2f}")
+                                    st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                    else:
+                        info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
+
+            except Exception as e:
+                info_placeholder.error(f"✗ Error: {str(e)}")
+
             st.divider()
+        else:
+            # ── PER-FILE MODE ──
+            for idx, uploaded_file in enumerate(uploaded_files, 1):
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+
+                    with col1:
+                        st.write(f"**{idx}. {uploaded_file.name}**")
+
+                    with col2:
+                        file_size = len(uploaded_file.getvalue()) / 1024
+                        st.caption(f"{file_size:.1f} KB")
+
+                    info_placeholder = st.empty()
+
+                    try:
+                        with st.spinner(f"Converting..."):
+                            gml_content = uploaded_file.read()
+
+                            result = convert_gml_to_ifc_bytes(
+                                gml_content=gml_content,
+                                filename=uploaded_file.name,
+                                use_map_conversion=use_map_conversion,
+                                boundary_polygon=boundary_polygon,
+                                input_crs_key=input_crs_key,
+                                output_crs_key=output_crs_key,
+                                color_map=color_map,
+                            )
+
+                            if result['success']:
+                                output_filename = Path(uploaded_file.name).stem + ".ifc"
+                                converted_files[output_filename] = result['ifc_bytes']
+
+                                msg_parts = ["✓ Converted"]
+                                if result.get('total_buildings') and result.get('kept_buildings') is not None:
+                                    if result['kept_buildings'] < result['total_buildings']:
+                                        msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
+                                    else:
+                                        msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
+                                msg_parts.append(f"{result['num_polygons']} polygon(s)")
+                                msg_parts.append(f"{result['epsg_code']}")
+                                info_placeholder.success(" • ".join(msg_parts))
+
+                                if result.get('bounds'):
+                                    bounds = result['bounds']
+                                    with st.expander("📍 Coordinate Bounds", expanded=False):
+                                        col_min, col_max = st.columns(2)
+                                        with col_min:
+                                            st.metric("Min X", f"{bounds['min'][0]:.2f}")
+                                            st.metric("Min Y", f"{bounds['min'][1]:.2f}")
+                                            st.metric("Min Z", f"{bounds['min'][2]:.2f}")
+                                        with col_max:
+                                            st.metric("Max X", f"{bounds['max'][0]:.2f}")
+                                            st.metric("Max Y", f"{bounds['max'][1]:.2f}")
+                                            st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                            else:
+                                info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
+
+                    except Exception as e:
+                        info_placeholder.error(f"✗ Error: {str(e)}")
+
+                st.divider()
         
         # DOWNLOAD SECTION
         if converted_files:
@@ -492,7 +634,7 @@ st.divider()
 st.markdown(
     """
     <div style='text-align: center; color: gray; font-size: 0.8em; padding: 1em 0;'>
-    GeoData Converter v1.0 | Built with Streamlit, IfcOpenShell & GDAL
+    GeoData Converter v1.1 | Built with Streamlit, IfcOpenShell & pyproj
     </div>
     """,
     unsafe_allow_html=True
