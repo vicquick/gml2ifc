@@ -19,6 +19,7 @@ from tif_converter import (
     extract_tif_metadata,
     convert_tif_to_shapefile,
     suggest_contour_interval,
+    convert_tif_to_dtm_points,
 )
 from wms_fetcher import (
     get_wms_layers,
@@ -47,7 +48,7 @@ st.divider()
 # ============================================================================
 # TABS
 # ============================================================================
-tab1, tab2 = st.tabs(["🏗️ GML → IFC", "📏 TIF → 3D Contour SHP"])
+tab1, tab2, tab3 = st.tabs(["🏗️ GML → IFC", "📏 TIF → 3D Contour SHP", "🏔️ TIF → 3D Grid SHP"])
 
 # ============================================================================
 # TAB 1: GML TO IFC
@@ -793,13 +794,270 @@ with tab2:
 
 
 # ============================================================================
+# TAB 3: TIF TO 3D DTM POINTS
+# ============================================================================
+with tab3:
+    st.subheader("TIF to 3D DTM Points")
+    st.markdown("Generate adaptive 3D loci from DGM elevation data for Vectorworks DTM import")
+
+    uploaded_grid_tif = st.file_uploader(
+        "Upload DGM GeoTIFF (float32 single band)",
+        type=['tif', 'tiff', 'TIF', 'TIFF'],
+        help="Upload a real elevation GeoTIFF (e.g., DGM1 tiles from daten-hamburg.de), NOT a styled WMS image",
+        key="grid_tif_uploader"
+    )
+
+    if uploaded_grid_tif:
+        grid_tif_bytes = uploaded_grid_tif.read()
+        file_size = len(grid_tif_bytes) / (1024 * 1024)
+
+        st.divider()
+
+        with st.spinner("Analyzing GeoTIFF..."):
+            grid_meta = extract_tif_metadata(grid_tif_bytes)
+
+        if grid_meta['success']:
+            st.success("DGM data loaded successfully")
+
+            with st.expander("TIF Metadata", expanded=True):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Resolution", f"{grid_meta['resolution']:.3f} m")
+                    st.metric("Width", f"{grid_meta['width']} px")
+                with col2:
+                    st.metric("EPSG Code", grid_meta['epsg_code'] or "Unknown")
+                    st.metric("Height", f"{grid_meta['height']} px")
+                with col3:
+                    st.metric("File Size", f"{file_size:.1f} MB")
+                    nodata_pct = grid_meta.get('nodata_pct', 0)
+                    st.metric("NoData", f"{nodata_pct:.1f}%")
+
+                st.markdown("**Elevation Range:**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Min", f"{grid_meta['elevation_range']['min']:.2f} m")
+                with col2:
+                    st.metric("Mean", f"{grid_meta['elevation_range']['mean']:.2f} m")
+                with col3:
+                    st.metric("Max", f"{grid_meta['elevation_range']['max']:.2f} m")
+
+                bounds = grid_meta['bounds']
+                st.caption(f"Left: {bounds['left']:.2f} | Bottom: {bounds['bottom']:.2f} | Right: {bounds['right']:.2f} | Top: {bounds['top']:.2f}")
+
+            st.divider()
+
+            # Optional BBox clip
+            grid_clip_gdf = None
+            with st.expander("Clip to Area (optional)"):
+                grid_clip_shp = st.file_uploader(
+                    "Upload boundary SHP (ZIP)",
+                    type=['zip'],
+                    help="ZIP containing a Shapefile to clip the grid extent",
+                    key="grid_clip_shp"
+                )
+                if grid_clip_shp:
+                    try:
+                        import geopandas as _gpd
+                        import tempfile as _tmpmod
+                        import zipfile as _zipmod
+
+                        clip_bytes = grid_clip_shp.read()
+                        with _tmpmod.TemporaryDirectory() as tmpdir:
+                            zip_path = Path(tmpdir) / "clip.zip"
+                            zip_path.write_bytes(clip_bytes)
+                            with _zipmod.ZipFile(zip_path, 'r') as zf:
+                                zf.extractall(tmpdir)
+                            shp_files = list(Path(tmpdir).glob("**/*.shp"))
+                            if not shp_files:
+                                st.error("No .shp file found in the uploaded ZIP")
+                            else:
+                                grid_clip_gdf = _gpd.read_file(shp_files[0])
+                                st.success(f"Clip boundary loaded: {len(grid_clip_gdf)} feature(s)")
+                    except Exception as e:
+                        st.error(f"Error reading clip SHP: {e}")
+
+            # Thinning mode
+            st.markdown("**Thinning Mode:**")
+            thin_mode = st.radio(
+                "Mode",
+                ["Adaptive (recommended)", "Uniform grid"],
+                index=0,
+                horizontal=True,
+                help="Adaptive: dense near slopes & buildings, sparse in flat areas. Uniform: fixed grid step everywhere.",
+                key="thin_mode"
+            )
+
+            if thin_mode == "Adaptive (recommended)":
+                col1, col2 = st.columns(2)
+                with col1:
+                    max_error = st.number_input(
+                        "Max error (m)",
+                        min_value=0.01,
+                        max_value=1.0,
+                        value=0.10,
+                        step=0.05,
+                        format="%.2f",
+                        help="Maximum allowed interpolation error. Lower = more points, higher = fewer points.",
+                        key="max_error"
+                    )
+                with col2:
+                    coarse_step = st.select_slider(
+                        "Coarse step (px)",
+                        options=[4, 5, 8, 10, 15, 20],
+                        value=10,
+                        help="Starting grid step before adaptive refinement. 10 = start at 10m grid, subdivide where needed.",
+                        key="coarse_step"
+                    )
+                total_px = grid_meta['width'] * grid_meta['height']
+                coarse_pts = (grid_meta['width'] // coarse_step) * (grid_meta['height'] // coarse_step)
+                st.caption(f"Starts with ~{coarse_pts:,} coarse points, refines where error > {max_error}m. "
+                           f"Typical result: 5-15k points for flat terrain.")
+                mode_key = 'adaptive'
+                step_val = coarse_step
+            else:
+                step_val = st.select_slider(
+                    "Grid Step (pixels)",
+                    options=[1, 2, 3, 5, 10, 20],
+                    value=5,
+                    help="Cell size in pixels. 5 = every 5th pixel (5m at 1m DGM).",
+                    key="grid_step"
+                )
+                max_error = 0.10
+                coarse_step = 10
+                est_pts = (grid_meta['width'] // step_val) * (grid_meta['height'] // step_val)
+                cell_size = grid_meta['resolution'] * step_val
+                st.caption(f"~{est_pts:,} points ({cell_size:.0f}m spacing)")
+                if est_pts > 100000:
+                    st.warning("Consider a larger step for better VW performance.")
+                mode_key = 'uniform'
+
+            # Output CRS
+            st.markdown("**Output CRS:**")
+            _grid_crs_labels = [f"{code} — {name}" for code, name in CRS_OPTIONS.items()]
+            grid_crs_label = st.selectbox(
+                "Output coordinate system",
+                ["Same as input"] + _grid_crs_labels,
+                index=0,
+                help=f"Input CRS: EPSG:{grid_meta['epsg_code'] or '?'}",
+                key="grid_output_crs"
+            )
+            if grid_crs_label == "Same as input":
+                grid_output_crs = None
+            else:
+                grid_output_crs = resolve_crs(grid_crs_label.split(" — ")[0])
+
+            st.divider()
+
+            # Generate
+            if st.button("Generate 3D Points", type="primary", use_container_width=True, key="grid_generate"):
+                with st.spinner("Generating 3D DTM points..."):
+                    grid_result = convert_tif_to_dtm_points(
+                        tif_bytes=grid_tif_bytes,
+                        filename=uploaded_grid_tif.name,
+                        mode=mode_key,
+                        step=step_val,
+                        max_error=max_error,
+                        coarse_step=coarse_step,
+                        clip_gdf=grid_clip_gdf,
+                        output_crs=grid_output_crs,
+                    )
+
+                if grid_result['success']:
+                    meta = grid_result['metadata']
+                    st.success(f"Generated {meta['num_points']:,} 3D points!")
+
+                    with st.expander("Generation Details", expanded=True):
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Points", f"{meta['num_points']:,}")
+                            if meta['mode'] == 'adaptive':
+                                st.metric("Max Error", f"{meta['max_error']}m")
+                            else:
+                                st.metric("Grid Step", f"{meta['grid_step']} px")
+                        with col2:
+                            out_crs = meta.get('output_crs_name')
+                            src_epsg = meta['epsg_code']
+                            if out_crs and out_crs != str(src_epsg):
+                                st.metric("Output CRS", out_crs)
+                                st.caption(f"(reprojected from EPSG:{src_epsg})")
+                            else:
+                                st.metric("EPSG Code", src_epsg or "Unknown")
+                            st.metric("Mode", meta['mode'].title())
+                        with col3:
+                            st.metric("Resolution", f"{meta['resolution']:.3f} m")
+                            st.metric("NoData", f"{meta.get('nodata_pct', 0):.1f}%")
+
+                        # Show compression ratio
+                        total_valid = grid_meta['width'] * grid_meta['height'] * (1 - grid_meta.get('nodata_pct', 0) / 100)
+                        ratio = total_valid / meta['num_points'] if meta['num_points'] > 0 else 0
+                        st.caption(f"Compression: {meta['num_points']:,} points from {int(total_valid):,} valid pixels ({ratio:.0f}x reduction)")
+
+                    st.divider()
+
+                    zip_size_kb = len(grid_result['zip_bytes']) / 1024
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.download_button(
+                            label=f"Download {grid_result['filename']}",
+                            data=grid_result['zip_bytes'],
+                            file_name=grid_result['filename'],
+                            mime="application/zip",
+                            use_container_width=True,
+                            key="download_grid_shp"
+                        )
+                    with col2:
+                        if zip_size_kb > 1024:
+                            st.metric("Size", f"{zip_size_kb/1024:.1f} MB")
+                        else:
+                            st.metric("Size", f"{zip_size_kb:.1f} KB")
+
+                    st.info("Import the PointZ shapefile into Vectorworks as 3D Loci, then use **Create DTM from Source Data** to generate a native DTM.")
+
+                else:
+                    st.error(f"Failed: {grid_result.get('error', 'Unknown error')}")
+
+        else:
+            st.error(f"Failed to read TIF: {grid_meta.get('error', 'Unknown error')}")
+
+    else:
+        st.info("Upload a DGM GeoTIFF (float32 elevation data) to get started")
+
+        with st.expander("About this converter"):
+            st.markdown("""
+            This tool generates **3D loci (PointZ)** from DGM elevation rasters
+            for import into Vectorworks as DTM source data.
+
+            **Important:** Use real elevation GeoTIFFs (float32), NOT styled WMS images.
+            Download DGM1 tiles from daten-hamburg.de or similar open data portals.
+
+            **Thinning Modes:**
+            - **Adaptive** (recommended): Starts with a coarse grid, subdivides only where
+              the terrain changes significantly. Dense near slopes and building edges,
+              sparse in flat areas. Guaranteed max error threshold.
+            - **Uniform**: Fixed grid step everywhere.
+
+            **Features:**
+            - Adaptive thinning (typically 90-95% point reduction)
+            - Full resolution at NoData edges (building boundaries)
+            - CRS reprojection (including LS320 for Hamburg)
+            - Optional spatial clip via Shapefile boundary
+
+            **Output:**
+            - ESRI Shapefile (PointZ) as ZIP
+            - Each point is a 3D locus with real elevation
+            - ELEVATION attribute for easy filtering
+            - Import into VW as 3D Loci for DTM generation
+            """)
+
+
+# ============================================================================
 # FOOTER
 # ============================================================================
 st.divider()
 st.markdown(
     """
     <div style='text-align: center; color: gray; font-size: 0.8em; padding: 1em 0;'>
-    GeoData Converter v1.1 | Built with Streamlit, IfcOpenShell & pyproj
+    GeoData Converter v1.2 | Built with Streamlit, IfcOpenShell & pyproj
     </div>
     """,
     unsafe_allow_html=True

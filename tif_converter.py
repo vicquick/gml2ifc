@@ -53,15 +53,19 @@ def extract_tif_metadata(tif_bytes):
 
                 # Get elevation range (ignoring nodata/NaN)
                 valid_data = data_float[~np.isnan(data_float)]
-                
+                total_pixels = data_float.size
+                nodata_count = total_pixels - len(valid_data)
+                nodata_pct = (nodata_count / total_pixels) * 100 if total_pixels > 0 else 0.0
+
                 elevation_range = {
                     'min': float(np.min(valid_data)),
                     'max': float(np.max(valid_data)),
                     'mean': float(np.mean(valid_data))
                 }
-                
+
                 return {
                     'success': True,
+                    'nodata_pct': nodata_pct,
                     'resolution': resolution,
                     'resolution_x': resolution_x,
                     'resolution_y': resolution_y,
@@ -567,3 +571,350 @@ def convert_tif_to_shapefile(
             'success': False,
             'error': str(e)
         }
+
+
+# ============================================================================
+# 3D ADAPTIVE POINT GRID GENERATION
+# ============================================================================
+def _prepare_raster(tif_bytes, clip_gdf=None):
+    """
+    Open raster, mask NoData, optionally compute pixel clip bounds.
+    Returns (data, transform, epsg_code, row_start, row_end, col_start, col_end)
+    or raises on failure.
+    """
+    memfile = rasterio.MemoryFile(tif_bytes)
+    src = memfile.open()
+    data = src.read(1).astype(np.float64)
+    nodata = src.nodata
+    if nodata is not None:
+        if np.isnan(nodata):
+            data[np.isnan(data)] = np.nan
+        else:
+            data[data == nodata] = np.nan
+    data[data <= -9990] = np.nan
+
+    transform = src.transform
+    epsg_code = src.crs.to_epsg() if src.crs else None
+    height, width = data.shape
+
+    row_start, row_end = 0, height - 1
+    col_start, col_end = 0, width - 1
+
+    if clip_gdf is not None and not clip_gdf.empty:
+        if clip_gdf.crs is not None and src.crs is not None:
+            clip_gdf = clip_gdf.to_crs(src.crs)
+        bounds = clip_gdf.total_bounds
+        inv_transform = ~transform
+        c_min, r_max = inv_transform * (bounds[0], bounds[1])
+        c_max, r_min = inv_transform * (bounds[2], bounds[3])
+        row_start = max(0, int(r_min))
+        row_end = min(height - 1, int(r_max) + 1)
+        col_start = max(0, int(c_min))
+        col_end = min(width - 1, int(c_max) + 1)
+
+    src.close()
+    memfile.close()
+    return data, transform, epsg_code, row_start, row_end, col_start, col_end
+
+
+def generate_adaptive_points(tif_bytes, max_error=0.10, coarse_step=10,
+                             clip_gdf=None):
+    """
+    Quadtree adaptive thinning: start coarse, subdivide cells where
+    bilinear interpolation error exceeds threshold.
+
+    Emits the CENTER point of each final (leaf) cell. Dense near slopes
+    and NoData edges, sparse in flat areas.
+
+    Args:
+        tif_bytes: GeoTIFF file as bytes
+        max_error: Maximum allowed elevation error in meters
+        coarse_step: Starting grid step in pixels (subdivides down to 1)
+        clip_gdf: Optional GeoDataFrame to clip extent
+
+    Returns:
+        dict with points list [{geometry, elevation}], epsg_code, stats
+    """
+    from shapely.geometry import Point
+
+    try:
+        data, transform, epsg_code, r0, r1, c0, c1 = _prepare_raster(tif_bytes, clip_gdf)
+        height, width = data.shape
+
+        points = []
+
+        def _cell_error(r, c, step):
+            """Max interpolation error within a cell defined by top-left (r,c) and size step."""
+            r_end = min(r + step, height - 1)
+            c_end = min(c + step, width - 1)
+            if r_end <= r or c_end <= c:
+                return 0.0, False
+
+            z_tl = data[r, c]
+            z_tr = data[r, c_end]
+            z_bl = data[r_end, c]
+            z_br = data[r_end, c_end]
+
+            # If any corner is NaN, cell touches NoData — must refine
+            if any(np.isnan(v) for v in [z_tl, z_tr, z_bl, z_br]):
+                return float('inf'), True
+
+            # Sample interior pixels
+            cell = data[r:r_end + 1, c:c_end + 1]
+            if cell.size <= 4:
+                return 0.0, False
+
+            rows_local = np.arange(cell.shape[0])
+            cols_local = np.arange(cell.shape[1])
+            fr = rows_local.astype(np.float64) / max(1, r_end - r)
+            fc = cols_local.astype(np.float64) / max(1, c_end - c)
+            FR, FC = np.meshgrid(fr, fc, indexing='ij')
+
+            interp = (z_tl * (1 - FR) * (1 - FC) +
+                      z_tr * (1 - FR) * FC +
+                      z_bl * FR * (1 - FC) +
+                      z_br * FR * FC)
+
+            diff = np.abs(cell - interp)
+            diff[np.isnan(cell)] = 0
+            return float(np.nanmax(diff)), False
+
+        def _process_cell(r, c, step):
+            """Recursively process a cell: emit center or subdivide."""
+            r_end = min(r + step, height - 1)
+            c_end = min(c + step, width - 1)
+
+            # Center pixel
+            cr = (r + r_end) // 2
+            cc = (c + c_end) // 2
+            z_center = data[cr, cc] if cr < height and cc < width else np.nan
+
+            if step <= 1 or (r_end - r <= 1 and c_end - c <= 1):
+                # Leaf cell: emit center if valid
+                if not np.isnan(z_center):
+                    x, y = transform * (cc + 0.5, cr + 0.5)
+                    points.append({
+                        'geometry': Point(x, y, float(z_center)),
+                        'elevation': float(z_center),
+                    })
+                return
+
+            err, has_nodata = _cell_error(r, c, step)
+
+            if err <= max_error and not has_nodata:
+                # Cell is flat enough: emit just the center point
+                if not np.isnan(z_center):
+                    x, y = transform * (cc + 0.5, cr + 0.5)
+                    points.append({
+                        'geometry': Point(x, y, float(z_center)),
+                        'elevation': float(z_center),
+                    })
+                return
+
+            # Subdivide into 4 quadrants
+            half = max(1, step // 2)
+            r_mid = r + half
+            c_mid = c + half
+
+            _process_cell(r, c, half)
+            if c_mid <= c1:
+                _process_cell(r, c_mid, half)
+            if r_mid <= r1:
+                _process_cell(r_mid, c, half)
+            if r_mid <= r1 and c_mid <= c1:
+                _process_cell(r_mid, c_mid, half)
+
+        # Increase recursion limit for deep quadtrees
+        import sys
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(old_limit, 10000))
+
+        # Process all coarse cells
+        for r in range(r0, r1 + 1, coarse_step):
+            for c in range(c0, c1 + 1, coarse_step):
+                _process_cell(r, c, coarse_step)
+
+        sys.setrecursionlimit(old_limit)
+
+        return {
+            'success': True,
+            'points': points,
+            'epsg_code': epsg_code,
+            'num_points': len(points),
+            'max_error': max_error,
+            'coarse_step': coarse_step,
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def generate_grid_points(tif_bytes, step=2, clip_gdf=None):
+    """
+    Generate a uniform grid of 3D loci from elevation GeoTIFF.
+
+    Args:
+        tif_bytes: GeoTIFF file as bytes
+        step: Grid step in pixels
+        clip_gdf: Optional GeoDataFrame to clip extent
+
+    Returns:
+        dict with points list, epsg_code, num_points, grid_step
+    """
+    from shapely.geometry import Point
+
+    try:
+        data, transform, epsg_code, r0, r1, c0, c1 = _prepare_raster(tif_bytes, clip_gdf)
+        height, width = data.shape
+
+        rows = np.arange(r0, r1 + 1, step)
+        cols = np.arange(c0, c1 + 1, step)
+        rows = rows[rows < height]
+        cols = cols[cols < width]
+
+        if len(rows) == 0 or len(cols) == 0:
+            return {'success': False, 'error': 'Grid is empty after clipping'}
+
+        # Vectorized extraction
+        r_ix = rows[:, None]
+        c_ix = cols[None, :]
+        z_vals = data[r_ix, c_ix]
+        valid = ~np.isnan(z_vals)
+
+        # Geographic coordinates
+        x_arr = transform[2] + (cols + 0.5) * transform[0]
+        y_arr = transform[5] + (rows + 0.5) * transform[4]
+
+        valid_r, valid_c = np.where(valid)
+        points = []
+        for i in range(len(valid_r)):
+            ri, ci = valid_r[i], valid_c[i]
+            z = float(z_vals[ri, ci])
+            points.append({
+                'geometry': Point(float(x_arr[ci]), float(y_arr[ri]), z),
+                'elevation': z,
+            })
+
+        return {
+            'success': True,
+            'points': points,
+            'epsg_code': epsg_code,
+            'num_points': len(points),
+            'grid_step': step,
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def export_points_to_shapefile_bytes(points, epsg_code=None, output_crs=None, filename_base="dtm_points"):
+    """
+    Export 3D points to PointZ shapefile as ZIP bytes, optionally reprojecting.
+    """
+    try:
+        if not points:
+            return {'success': False, 'error': 'No points to export'}
+
+        gdf = gpd.GeoDataFrame(points)
+
+        if epsg_code:
+            gdf.crs = f"EPSG:{epsg_code}"
+
+        output_crs_name = str(epsg_code) if epsg_code else None
+        if output_crs is not None and gdf.crs is not None:
+            gdf = gdf.to_crs(output_crs)
+            try:
+                out_epsg = gdf.crs.to_epsg()
+                output_crs_name = str(out_epsg) if out_epsg else gdf.crs.name
+            except Exception:
+                output_crs_name = str(output_crs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shp_path = os.path.join(tmpdir, f"{filename_base}.shp")
+            gdf.to_file(shp_path, driver='ESRI Shapefile')
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for file in os.listdir(tmpdir):
+                    if file.startswith(filename_base):
+                        zip_file.write(os.path.join(tmpdir, file), file)
+
+            zip_buffer.seek(0)
+            return {
+                'success': True,
+                'zip_bytes': zip_buffer.getvalue(),
+                'num_features': len(points),
+                'filename': f"{filename_base}.zip",
+                'output_crs_name': output_crs_name,
+            }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def convert_tif_to_dtm_points(tif_bytes, filename, mode='adaptive',
+                               step=2, max_error=0.10, coarse_step=10,
+                               clip_gdf=None, output_crs=None):
+    """
+    Convert GeoTIFF to 3D point shapefile for VW DTM generation.
+
+    Args:
+        tif_bytes: GeoTIFF file as bytes
+        filename: Original filename
+        mode: 'adaptive' (smart thinning) or 'uniform' (fixed grid step)
+        step: Grid step for uniform mode
+        max_error: Max elevation error for adaptive mode (meters)
+        coarse_step: Starting coarse step for adaptive mode
+        clip_gdf: Optional GeoDataFrame for spatial clip
+        output_crs: Target CRS for reprojection
+
+    Returns:
+        dict with success, zip_bytes, metadata
+    """
+    try:
+        metadata = extract_tif_metadata(tif_bytes)
+        if not metadata['success']:
+            return metadata
+
+        if mode == 'adaptive':
+            result = generate_adaptive_points(
+                tif_bytes, max_error=max_error, coarse_step=coarse_step,
+                clip_gdf=clip_gdf,
+            )
+        else:
+            result = generate_grid_points(tif_bytes, step=step, clip_gdf=clip_gdf)
+
+        if not result['success']:
+            return result
+
+        filename_base = Path(filename).stem + "_dtm_points"
+        export_result = export_points_to_shapefile_bytes(
+            result['points'],
+            epsg_code=result['epsg_code'],
+            output_crs=output_crs,
+            filename_base=filename_base,
+        )
+
+        if not export_result['success']:
+            return export_result
+
+        return {
+            'success': True,
+            'zip_bytes': export_result['zip_bytes'],
+            'filename': export_result['filename'],
+            'metadata': {
+                'epsg_code': result['epsg_code'],
+                'output_crs_name': export_result.get('output_crs_name'),
+                'num_points': result['num_points'],
+                'mode': mode,
+                'max_error': max_error if mode == 'adaptive' else None,
+                'coarse_step': coarse_step if mode == 'adaptive' else None,
+                'grid_step': step if mode == 'uniform' else None,
+                'resolution': metadata['resolution'],
+                'elevation_range': metadata['elevation_range'],
+                'nodata_pct': metadata.get('nodata_pct', 0),
+            }
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
