@@ -20,6 +20,7 @@ from tif_converter import (
     convert_tif_to_shapefile,
     suggest_contour_interval,
     convert_tif_to_dtm_points,
+    convert_tif_to_combined_dtm,
 )
 from wms_fetcher import (
     get_wms_layers,
@@ -876,18 +877,56 @@ with tab3:
                     except Exception as e:
                         st.error(f"Error reading clip SHP: {e}")
 
-            # Thinning mode
-            st.markdown("**Thinning Mode:**")
-            thin_mode = st.radio(
+            # Export mode
+            st.markdown("**Export Mode:**")
+            export_mode = st.radio(
                 "Mode",
-                ["Adaptive (recommended)", "Uniform grid"],
+                ["Combined: Contours + Critical Points (recommended)",
+                 "Adaptive point thinning",
+                 "Uniform point grid"],
                 index=0,
-                horizontal=True,
-                help="Adaptive: dense near slopes & buildings, sparse in flat areas. Uniform: fixed grid step everywhere.",
-                key="thin_mode"
+                help="Combined gives best accuracy with fewest features. Adaptive uses quadtree thinning. Uniform is a simple fixed grid.",
+                key="export_mode"
             )
 
-            if thin_mode == "Adaptive (recommended)":
+            if export_mode.startswith("Combined"):
+                mode_key = 'combined'
+                elev_span = grid_meta['elevation_range']['max'] - grid_meta['elevation_range']['min']
+                suggested = suggest_contour_interval(
+                    grid_meta['resolution'],
+                    grid_meta['elevation_range']['min'],
+                    grid_meta['elevation_range']['max'],
+                    target_contours=50,
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    contour_interval = st.number_input(
+                        "Contour interval (m)",
+                        min_value=0.05,
+                        max_value=5.0,
+                        value=min(0.25, float(suggested)),
+                        step=0.05,
+                        format="%.2f",
+                        help=f"Elevation span: {elev_span:.1f}m. Smaller = more accurate, more polylines.",
+                        key="combined_interval"
+                    )
+                with col2:
+                    edge_step = st.select_slider(
+                        "Edge point density",
+                        options=[1, 2, 3, 5],
+                        value=2,
+                        help="Pixel step along building NoData edges. 1 = every pixel, 2 = every other.",
+                        key="edge_step"
+                    )
+                est_contours = int(elev_span / contour_interval) if contour_interval > 0 else 0
+                st.caption(f"~{est_contours} contour levels + peaks/pits + building-edge points. "
+                           f"Max vertical error: {contour_interval/2:.3f}m (corrected by critical points)")
+                max_error = 0.10
+                coarse_step = 10
+                step_val = 5
+
+            elif export_mode.startswith("Adaptive"):
+                mode_key = 'adaptive'
                 col1, col2 = st.columns(2)
                 with col1:
                     max_error = st.number_input(
@@ -897,7 +936,7 @@ with tab3:
                         value=0.10,
                         step=0.05,
                         format="%.2f",
-                        help="Maximum allowed interpolation error. Lower = more points, higher = fewer points.",
+                        help="Maximum allowed interpolation error.",
                         key="max_error"
                     )
                 with col2:
@@ -905,16 +944,16 @@ with tab3:
                         "Coarse step (px)",
                         options=[4, 5, 8, 10, 15, 20],
                         value=10,
-                        help="Starting grid step before adaptive refinement. 10 = start at 10m grid, subdivide where needed.",
+                        help="Starting grid step before adaptive refinement.",
                         key="coarse_step"
                     )
-                total_px = grid_meta['width'] * grid_meta['height']
-                coarse_pts = (grid_meta['width'] // coarse_step) * (grid_meta['height'] // coarse_step)
-                st.caption(f"Starts with ~{coarse_pts:,} coarse points, refines where error > {max_error}m. "
-                           f"Typical result: 5-15k points for flat terrain.")
-                mode_key = 'adaptive'
+                st.caption(f"Quadtree subdivision where error > {max_error}m. Dense near slopes & buildings.")
                 step_val = coarse_step
+                contour_interval = 0.25
+                edge_step = 2
+
             else:
+                mode_key = 'uniform'
                 step_val = st.select_slider(
                     "Grid Step (pixels)",
                     options=[1, 2, 3, 5, 10, 20],
@@ -924,12 +963,13 @@ with tab3:
                 )
                 max_error = 0.10
                 coarse_step = 10
+                contour_interval = 0.25
+                edge_step = 2
                 est_pts = (grid_meta['width'] // step_val) * (grid_meta['height'] // step_val)
                 cell_size = grid_meta['resolution'] * step_val
                 st.caption(f"~{est_pts:,} points ({cell_size:.0f}m spacing)")
                 if est_pts > 100000:
                     st.warning("Consider a larger step for better VW performance.")
-                mode_key = 'uniform'
 
             # Output CRS
             st.markdown("**Output CRS:**")
@@ -949,48 +989,83 @@ with tab3:
             st.divider()
 
             # Generate
-            if st.button("Generate 3D Points", type="primary", use_container_width=True, key="grid_generate"):
-                with st.spinner("Generating 3D DTM points..."):
-                    grid_result = convert_tif_to_dtm_points(
-                        tif_bytes=grid_tif_bytes,
-                        filename=uploaded_grid_tif.name,
-                        mode=mode_key,
-                        step=step_val,
-                        max_error=max_error,
-                        coarse_step=coarse_step,
-                        clip_gdf=grid_clip_gdf,
-                        output_crs=grid_output_crs,
-                    )
+            btn_label = "Generate DTM Data" if mode_key == 'combined' else "Generate 3D Points"
+            if st.button(btn_label, type="primary", use_container_width=True, key="grid_generate"):
+                if mode_key == 'combined':
+                    with st.spinner("Generating contours + critical points..."):
+                        grid_result = convert_tif_to_combined_dtm(
+                            tif_bytes=grid_tif_bytes,
+                            filename=uploaded_grid_tif.name,
+                            contour_interval=contour_interval,
+                            clip_gdf=grid_clip_gdf,
+                            output_crs=grid_output_crs,
+                            edge_step=edge_step,
+                        )
+                else:
+                    with st.spinner("Generating 3D DTM points..."):
+                        grid_result = convert_tif_to_dtm_points(
+                            tif_bytes=grid_tif_bytes,
+                            filename=uploaded_grid_tif.name,
+                            mode=mode_key,
+                            step=step_val,
+                            max_error=max_error,
+                            coarse_step=coarse_step,
+                            clip_gdf=grid_clip_gdf,
+                            output_crs=grid_output_crs,
+                        )
 
                 if grid_result['success']:
                     meta = grid_result['metadata']
-                    st.success(f"Generated {meta['num_points']:,} 3D points!")
 
-                    with st.expander("Generation Details", expanded=True):
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("Points", f"{meta['num_points']:,}")
-                            if meta['mode'] == 'adaptive':
-                                st.metric("Max Error", f"{meta['max_error']}m")
-                            else:
-                                st.metric("Grid Step", f"{meta['grid_step']} px")
-                        with col2:
-                            out_crs = meta.get('output_crs_name')
-                            src_epsg = meta['epsg_code']
-                            if out_crs and out_crs != str(src_epsg):
-                                st.metric("Output CRS", out_crs)
-                                st.caption(f"(reprojected from EPSG:{src_epsg})")
-                            else:
-                                st.metric("EPSG Code", src_epsg or "Unknown")
-                            st.metric("Mode", meta['mode'].title())
-                        with col3:
-                            st.metric("Resolution", f"{meta['resolution']:.3f} m")
-                            st.metric("NoData", f"{meta.get('nodata_pct', 0):.1f}%")
+                    if mode_key == 'combined':
+                        total_features = meta['num_contours'] + meta['num_critical_points']
+                        st.success(f"Generated {meta['num_contours']:,} contour polylines + {meta['num_critical_points']:,} critical points!")
 
-                        # Show compression ratio
-                        total_valid = grid_meta['width'] * grid_meta['height'] * (1 - grid_meta.get('nodata_pct', 0) / 100)
-                        ratio = total_valid / meta['num_points'] if meta['num_points'] > 0 else 0
-                        st.caption(f"Compression: {meta['num_points']:,} points from {int(total_valid):,} valid pixels ({ratio:.0f}x reduction)")
+                        with st.expander("Generation Details", expanded=True):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Contour Lines", f"{meta['num_contours']:,}")
+                                st.metric("Interval", f"{meta['contour_interval']}m")
+                            with col2:
+                                st.metric("Critical Points", f"{meta['num_critical_points']:,}")
+                                st.caption(f"Peaks: {meta['num_peaks']} | Pits: {meta['num_pits']} | Edges: {meta['num_edges']}")
+                            with col3:
+                                out_crs = meta.get('output_crs_name')
+                                src_epsg = meta['epsg_code']
+                                if out_crs and out_crs != str(src_epsg):
+                                    st.metric("Output CRS", out_crs)
+                                    st.caption(f"(from EPSG:{src_epsg})")
+                                else:
+                                    st.metric("EPSG Code", src_epsg or "Unknown")
+
+                            total_valid = grid_meta['width'] * grid_meta['height'] * (1 - grid_meta.get('nodata_pct', 0) / 100)
+                            st.caption(f"Total features: {total_features:,} from {int(total_valid):,} valid pixels ({total_valid/max(1,total_features):.0f}x reduction)")
+
+                    else:
+                        st.success(f"Generated {meta['num_points']:,} 3D points!")
+
+                        with st.expander("Generation Details", expanded=True):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Points", f"{meta['num_points']:,}")
+                                if meta['mode'] == 'adaptive':
+                                    st.metric("Max Error", f"{meta['max_error']}m")
+                                else:
+                                    st.metric("Grid Step", f"{meta['grid_step']} px")
+                            with col2:
+                                out_crs = meta.get('output_crs_name')
+                                src_epsg = meta['epsg_code']
+                                if out_crs and out_crs != str(src_epsg):
+                                    st.metric("Output CRS", out_crs)
+                                    st.caption(f"(from EPSG:{src_epsg})")
+                                else:
+                                    st.metric("EPSG Code", src_epsg or "Unknown")
+                            with col3:
+                                st.metric("Mode", meta['mode'].title())
+
+                            total_valid = grid_meta['width'] * grid_meta['height'] * (1 - grid_meta.get('nodata_pct', 0) / 100)
+                            ratio = total_valid / meta['num_points'] if meta['num_points'] > 0 else 0
+                            st.caption(f"{meta['num_points']:,} points from {int(total_valid):,} pixels ({ratio:.0f}x reduction)")
 
                     st.divider()
 
@@ -1011,7 +1086,11 @@ with tab3:
                         else:
                             st.metric("Size", f"{zip_size_kb:.1f} KB")
 
-                    st.info("Import the PointZ shapefile into Vectorworks as 3D Loci, then use **Create DTM from Source Data** to generate a native DTM.")
+                    if mode_key == 'combined':
+                        st.info("ZIP contains 2 shapefiles: **contours** (PolylineZ) + **critical points** (PointZ). "
+                                "Import both into Vectorworks, select all, then **Create DTM from Source Data**.")
+                    else:
+                        st.info("Import the PointZ shapefile into Vectorworks as 3D Loci, then use **Create DTM from Source Data**.")
 
                 else:
                     st.error(f"Failed: {grid_result.get('error', 'Unknown error')}")
@@ -1024,29 +1103,25 @@ with tab3:
 
         with st.expander("About this converter"):
             st.markdown("""
-            This tool generates **3D loci (PointZ)** from DGM elevation rasters
-            for import into Vectorworks as DTM source data.
+            Generate optimized DTM source data from DGM elevation rasters
+            for import into Vectorworks.
 
             **Important:** Use real elevation GeoTIFFs (float32), NOT styled WMS images.
             Download DGM1 tiles from daten-hamburg.de or similar open data portals.
 
-            **Thinning Modes:**
-            - **Adaptive** (recommended): Starts with a coarse grid, subdivides only where
-              the terrain changes significantly. Dense near slopes and building edges,
-              sparse in flat areas. Guaranteed max error threshold.
-            - **Uniform**: Fixed grid step everywhere.
-
-            **Features:**
-            - Adaptive thinning (typically 90-95% point reduction)
-            - Full resolution at NoData edges (building boundaries)
-            - CRS reprojection (including LS320 for Hamburg)
-            - Optional spatial clip via Shapefile boundary
+            **Export Modes:**
+            - **Combined** (recommended): Contour polylines + critical points (peaks,
+              pits, building-edge ground truth). Best accuracy-to-size ratio. Two
+              shapefiles in one ZIP — import both into VW for DTM generation.
+            - **Adaptive**: Quadtree point thinning. Dense near slopes & NoData edges,
+              sparse in flat areas.
+            - **Uniform**: Fixed grid step everywhere. Simple but less efficient.
 
             **Output:**
-            - ESRI Shapefile (PointZ) as ZIP
-            - Each point is a 3D locus with real elevation
-            - ELEVATION attribute for easy filtering
-            - Import into VW as 3D Loci for DTM generation
+            - Combined: PolylineZ contours + PointZ critical points in one ZIP
+            - Adaptive/Uniform: PointZ shapefile
+            - CRS reprojection (including LS320 for Hamburg)
+            - Import into VW → Create DTM from Source Data
             """)
 
 

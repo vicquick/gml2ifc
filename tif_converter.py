@@ -807,6 +807,221 @@ def generate_grid_points(tif_bytes, step=2, clip_gdf=None):
         return {'success': False, 'error': str(e)}
 
 
+def extract_critical_points(tif_bytes, clip_gdf=None, edge_step=1,
+                            extrema_kernel=11, extrema_threshold=0.15):
+    """
+    Extract terrain-critical 3D points from elevation GeoTIFF:
+      - Local maxima (peaks) and minima (pits)
+      - NoData-edge points (building boundary ground truth) at edge_step resolution
+
+    Args:
+        tif_bytes: GeoTIFF file as bytes
+        clip_gdf: Optional GeoDataFrame to clip extent
+        edge_step: Pixel step along NoData edges (1 = every pixel, 2 = every other)
+        extrema_kernel: Neighborhood size for peak/pit detection (pixels)
+        extrema_threshold: Min deviation from local mean to count as significant (meters)
+
+    Returns:
+        dict with points list [{geometry, elevation, point_type}], epsg_code
+    """
+    from shapely.geometry import Point
+    from scipy.ndimage import minimum_filter, maximum_filter, binary_dilation
+
+    try:
+        data, transform, epsg_code, r0, r1, c0, c1 = _prepare_raster(tif_bytes, clip_gdf)
+        height, width = data.shape
+
+        # Work within clip bounds
+        roi = data[r0:r1 + 1, c0:c1 + 1].copy()
+        roi_h, roi_w = roi.shape
+
+        points = []
+
+        # --- Local extrema (peaks & pits) ---
+        kernel = extrema_kernel
+        pad = kernel // 2
+
+        # Replace NaN for filter operations
+        roi_filled = roi.copy()
+        nan_mask = np.isnan(roi_filled)
+        roi_filled[nan_mask] = np.nanmean(roi_filled)
+
+        local_min = minimum_filter(roi_filled, size=kernel)
+        local_max = maximum_filter(roi_filled, size=kernel)
+
+        is_peak = (roi_filled == local_max) & ~nan_mask
+        is_pit = (roi_filled == local_min) & ~nan_mask
+
+        # Only keep extrema that deviate meaningfully from local mean
+        from scipy.ndimage import uniform_filter
+        local_mean = uniform_filter(roi_filled, size=kernel)
+        peak_diff = np.abs(roi_filled - local_mean)
+
+        significant = peak_diff > extrema_threshold
+        is_peak = is_peak & significant
+        is_pit = is_pit & significant
+
+        # Exclude border pixels
+        is_peak[:pad, :] = False; is_peak[-pad:, :] = False
+        is_peak[:, :pad] = False; is_peak[:, -pad:] = False
+        is_pit[:pad, :] = False; is_pit[-pad:, :] = False
+        is_pit[:, :pad] = False; is_pit[:, -pad:] = False
+
+        for label, mask in [('peak', is_peak), ('pit', is_pit)]:
+            rs, cs = np.where(mask)
+            for r, c in zip(rs, cs):
+                gr = r + r0
+                gc = c + c0
+                z = float(data[gr, gc])
+                x, y = transform * (gc + 0.5, gr + 0.5)
+                points.append({
+                    'geometry': Point(x, y, z),
+                    'elevation': z,
+                    'type': label,
+                })
+
+        # --- NoData edge points (building boundary ground truth) ---
+        struct = np.ones((3, 3))
+        dilated = binary_dilation(nan_mask[r0:r1 + 1, c0:c1 + 1], structure=struct)
+        edge_mask = dilated & ~nan_mask[r0:r1 + 1, c0:c1 + 1]
+
+        edge_rs, edge_cs = np.where(edge_mask)
+        # Thin edges by step
+        if edge_step > 1:
+            keep = np.arange(0, len(edge_rs), edge_step)
+            edge_rs = edge_rs[keep]
+            edge_cs = edge_cs[keep]
+
+        for r, c in zip(edge_rs, edge_cs):
+            gr = r + r0
+            gc = c + c0
+            z = float(data[gr, gc])
+            if np.isnan(z):
+                continue
+            x, y = transform * (gc + 0.5, gr + 0.5)
+            points.append({
+                'geometry': Point(x, y, z),
+                'elevation': z,
+                'type': 'edge',
+            })
+
+        return {
+            'success': True,
+            'points': points,
+            'epsg_code': epsg_code,
+            'num_points': len(points),
+            'num_peaks': int(np.sum(is_peak)),
+            'num_pits': int(np.sum(is_pit)),
+            'num_edges': len(edge_rs),
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def convert_tif_to_combined_dtm(tif_bytes, filename, contour_interval=0.25,
+                                 clip_gdf=None, output_crs=None, edge_step=1):
+    """
+    Combined DTM export: contour polylines + critical/edge points.
+
+    Produces a ZIP with two shapefiles:
+      - *_contours.shp (PolylineZ) — terrain shape
+      - *_points.shp (PointZ) — peaks, pits, building-edge ground truth
+
+    Import both into VW → Create DTM from Source Data for best accuracy.
+
+    Args:
+        tif_bytes: GeoTIFF bytes
+        filename: Original filename
+        contour_interval: Contour interval in meters
+        clip_gdf: Optional clip boundary
+        output_crs: Target CRS
+        edge_step: Pixel step for NoData edge points (1=full res, 2=every other)
+
+    Returns:
+        dict with success, zip_bytes, metadata
+    """
+    try:
+        metadata = extract_tif_metadata(tif_bytes)
+        if not metadata['success']:
+            return metadata
+
+        # Generate contours
+        contour_result = generate_contours_from_tif(
+            tif_bytes, interval=contour_interval,
+        )
+        if not contour_result['success']:
+            return contour_result
+
+        # Extract critical points
+        critical_result = extract_critical_points(
+            tif_bytes, clip_gdf=clip_gdf, edge_step=edge_step,
+        )
+        if not critical_result['success']:
+            return critical_result
+
+        filename_base = Path(filename).stem
+        contour_base = f"{filename_base}_contours"
+        points_base = f"{filename_base}_critical"
+
+        # Export contours
+        contour_export = export_contours_to_shapefile_bytes(
+            contour_result['contours'],
+            epsg_code=contour_result['epsg_code'],
+            output_crs=output_crs,
+            filename_base=contour_base,
+        )
+        if not contour_export['success']:
+            return contour_export
+
+        # Export critical points
+        points_export = export_points_to_shapefile_bytes(
+            critical_result['points'],
+            epsg_code=critical_result['epsg_code'],
+            output_crs=output_crs,
+            filename_base=points_base,
+        )
+        if not points_export['success']:
+            return points_export
+
+        # Merge both ZIPs into one
+        combined_zip = io.BytesIO()
+        with zipfile.ZipFile(combined_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
+            # Add contour SHP files
+            with zipfile.ZipFile(io.BytesIO(contour_export['zip_bytes'])) as zin:
+                for item in zin.namelist():
+                    zout.writestr(item, zin.read(item))
+            # Add point SHP files
+            with zipfile.ZipFile(io.BytesIO(points_export['zip_bytes'])) as zin:
+                for item in zin.namelist():
+                    zout.writestr(item, zin.read(item))
+
+        combined_zip.seek(0)
+        combined_filename = f"{filename_base}_dtm_combined.zip"
+
+        return {
+            'success': True,
+            'zip_bytes': combined_zip.getvalue(),
+            'filename': combined_filename,
+            'metadata': {
+                'epsg_code': contour_result['epsg_code'],
+                'output_crs_name': contour_export.get('output_crs_name'),
+                'num_contours': len(contour_result['contours']),
+                'contour_interval': contour_interval,
+                'num_critical_points': critical_result['num_points'],
+                'num_peaks': critical_result['num_peaks'],
+                'num_pits': critical_result['num_pits'],
+                'num_edges': critical_result['num_edges'],
+                'resolution': metadata['resolution'],
+                'elevation_range': metadata['elevation_range'],
+                'nodata_pct': metadata.get('nodata_pct', 0),
+            }
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
 def export_points_to_shapefile_bytes(points, epsg_code=None, output_crs=None, filename_base="dtm_points"):
     """
     Export 3D points to PointZ shapefile as ZIP bytes, optionally reprojecting.
