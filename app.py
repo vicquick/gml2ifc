@@ -428,21 +428,41 @@ with tab2:
 
     tif_bytes = None
     source_filename = None
+    tif_files_list = []   # [(name, bytes), ...] for batch mode
 
     # ── UPLOAD TIF BRANCH ──
     if input_mode == "Upload TIF":
-        st.subheader("Upload TIF File")
+        st.subheader("Upload TIF File(s)")
 
-        uploaded_tif = st.file_uploader(
-            "Select a GeoTIFF elevation file",
-            type=['tif', 'tiff', 'TIF', 'TIFF'],
-            help="Upload a GeoTIFF file containing elevation data (e.g., DGM1)",
+        uploaded_tifs = st.file_uploader(
+            "Select GeoTIFF elevation file(s) or a ZIP of TIF files",
+            type=['tif', 'tiff', 'TIF', 'TIFF', 'zip'],
+            accept_multiple_files=True,
+            help="Upload one or more GeoTIFF files, or a ZIP containing TIF files.",
             key="tif_uploader"
         )
 
-        if uploaded_tif:
-            tif_bytes = uploaded_tif.read()
-            source_filename = uploaded_tif.name
+        if uploaded_tifs:
+            for _f in uploaded_tifs:
+                if _f.name.lower().endswith('.zip'):
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(_f.read())) as _zf:
+                            for _n in _zf.namelist():
+                                if _n.lower().endswith(('.tif', '.tiff')):
+                                    tif_files_list.append((_n, _zf.read(_n)))
+                    except Exception as _ze:
+                        st.error(f"Cannot read ZIP {_f.name}: {_ze}")
+                else:
+                    tif_files_list.append((_f.name, _f.read()))
+
+        if tif_files_list:
+            tif_bytes = tif_files_list[0][1]
+            source_filename = tif_files_list[0][0]
+            if len(tif_files_list) > 1:
+                st.info(f"**{len(tif_files_list)} files loaded.** Settings below apply to all.")
+                with st.expander("Files loaded"):
+                    for _n, _b in tif_files_list:
+                        st.caption(f"• {_n}  ({len(_b)/1024/1024:.1f} MB)")
 
     # ── FETCH FROM WMS BRANCH ──
     else:
@@ -551,6 +571,7 @@ with tab2:
         if 'wms_tif_bytes' in st.session_state:
             tif_bytes = st.session_state['wms_tif_bytes']
             source_filename = st.session_state.get('wms_source_filename', 'wms_elevation.tif')
+            tif_files_list = [(source_filename, tif_bytes)]
 
     # ── SHARED SECTION: metadata, settings, generation ──
     if tif_bytes is not None:
@@ -710,71 +731,130 @@ with tab2:
             st.divider()
 
             # GENERATE BUTTON
-            if st.button("Generate Contours", type="primary", use_container_width=True):
-                with st.spinner("Generating contours... This may take a while for large files."):
-                    result = convert_tif_to_shapefile(
-                        tif_bytes=tif_bytes,
-                        filename=source_filename,
-                        interval=interval,
-                        min_elevation=min_elev,
-                        max_elevation=max_elev,
-                        simplification_method=simplification_method,
-                        simplification_params=simplification_params,
-                        output_crs=output_crs,
-                    )
+            _n_files = len(tif_files_list) if tif_files_list else 1
+            _btn_label = "Generate Contours" if _n_files <= 1 else f"Generate Contours ({_n_files} files)"
+            if st.button(_btn_label, type="primary", use_container_width=True):
 
-                if result['success']:
-                    st.success(f"Successfully generated {result['metadata']['num_contours']} contour lines!")
-
-                    # Display generation info
-                    with st.expander("Generation Details", expanded=True):
-                        col1, col2, col3 = st.columns(3)
-
-                        with col1:
-                            st.metric("Contours", result['metadata']['num_contours'])
-                            st.metric("Interval", f"{result['metadata']['interval']} m")
-
-                        with col2:
-                            out_crs = result['metadata'].get('output_crs_name')
-                            src_epsg = result['metadata']['epsg_code']
-                            if out_crs and out_crs != str(src_epsg):
-                                st.metric("Output CRS", out_crs)
-                                st.caption(f"(reprojected from EPSG:{src_epsg})")
-                            else:
-                                st.metric("EPSG Code", src_epsg or "Unknown")
-                            st.metric("Resolution", f"{result['metadata']['resolution']:.3f} m")
-
-                        with col3:
-                            st.metric("Simplification", result['metadata']['simplification'].replace('-', ' ').title())
-
-                        st.markdown("**Contour Levels:**")
-                        levels = result['metadata']['contour_levels']
-                        st.caption(f"{len(levels)} levels from {min(levels):.1f}m to {max(levels):.1f}m")
-
-                    st.divider()
-
-                    # DOWNLOAD SECTION
-                    st.subheader("Download Shapefile")
-
-                    zip_size_kb = len(result['zip_bytes']) / 1024
-
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.download_button(
-                            label=f"Download {result['filename']}",
-                            data=result['zip_bytes'],
-                            file_name=result['filename'],
-                            mime="application/zip",
-                            use_container_width=True,
-                            key="download_shapefile"
+                if _n_files <= 1:
+                    # ── SINGLE FILE ──
+                    with st.spinner("Generating contours..."):
+                        result = convert_tif_to_shapefile(
+                            tif_bytes=tif_bytes,
+                            filename=source_filename,
+                            interval=interval,
+                            min_elevation=min_elev,
+                            max_elevation=max_elev,
+                            simplification_method=simplification_method,
+                            simplification_params=simplification_params,
+                            output_crs=output_crs,
                         )
-                    with col2:
-                        st.metric("Size", f"{zip_size_kb:.1f} KB")
 
-                    st.info("The ZIP contains all shapefile components (.shp, .shx, .dbf, .prj). Extract all files to the same directory to use the shapefile.")
+                    if result['success']:
+                        st.success(f"Successfully generated {result['metadata']['num_contours']} contour lines!")
+
+                        with st.expander("Generation Details", expanded=True):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Contours", result['metadata']['num_contours'])
+                                st.metric("Interval", f"{result['metadata']['interval']} m")
+                            with col2:
+                                out_crs = result['metadata'].get('output_crs_name')
+                                src_epsg = result['metadata']['epsg_code']
+                                if out_crs and out_crs != str(src_epsg):
+                                    st.metric("Output CRS", out_crs)
+                                    st.caption(f"(reprojected from EPSG:{src_epsg})")
+                                else:
+                                    st.metric("EPSG Code", src_epsg or "Unknown")
+                                st.metric("Resolution", f"{result['metadata']['resolution']:.3f} m")
+                            with col3:
+                                st.metric("Simplification", result['metadata']['simplification'].replace('-', ' ').title())
+                            st.markdown("**Contour Levels:**")
+                            levels = result['metadata']['contour_levels']
+                            st.caption(f"{len(levels)} levels from {min(levels):.1f}m to {max(levels):.1f}m")
+
+                        st.divider()
+                        st.subheader("Download Shapefile")
+                        zip_size_kb = len(result['zip_bytes']) / 1024
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.download_button(
+                                label=f"Download {result['filename']}",
+                                data=result['zip_bytes'],
+                                file_name=result['filename'],
+                                mime="application/zip",
+                                use_container_width=True,
+                                key="download_shapefile"
+                            )
+                        with col2:
+                            st.metric("Size", f"{zip_size_kb:.1f} KB")
+                        st.info("ZIP contains all shapefile components (.shp, .shx, .dbf, .prj).")
+
+                    else:
+                        st.error(f"Failed: {result.get('error', 'Unknown error')}")
 
                 else:
-                    st.error(f"Failed to generate contours: {result.get('error', 'Unknown error')}")
+                    # ── BATCH MODE ──
+                    prog = st.progress(0.0)
+                    batch_results = []
+                    for _i, (_fname, _fbytes) in enumerate(tif_files_list):
+                        prog.progress(_i / _n_files, text=f"Processing {_fname} ({_i+1}/{_n_files})...")
+                        _r = convert_tif_to_shapefile(
+                            tif_bytes=_fbytes,
+                            filename=_fname,
+                            interval=interval,
+                            min_elevation=min_elev,
+                            max_elevation=max_elev,
+                            simplification_method=simplification_method,
+                            simplification_params=simplification_params,
+                            output_crs=output_crs,
+                        )
+                        batch_results.append((_fname, _r))
+                    prog.progress(1.0, text="Done")
+
+                    _ok = [(_n, _r) for _n, _r in batch_results if _r['success']]
+                    _fail = [(_n, _r) for _n, _r in batch_results if not _r['success']]
+
+                    if _ok:
+                        st.success(f"Generated contours for {len(_ok)}/{_n_files} files")
+
+                        # Pack all shapefiles into one combined ZIP
+                        _combined = io.BytesIO()
+                        with zipfile.ZipFile(_combined, 'w', zipfile.ZIP_DEFLATED) as _outer:
+                            for _fname, _r in _ok:
+                                _inner = zipfile.ZipFile(io.BytesIO(_r['zip_bytes']))
+                                for _item in _inner.namelist():
+                                    _outer.writestr(_item, _inner.read(_item))
+                        _combined.seek(0)
+
+                        with st.expander("Results", expanded=True):
+                            for _fname, _r in _ok:
+                                _m = _r['metadata']
+                                st.caption(
+                                    f"✓ {_fname}: {_m['num_contours']:,} contours "
+                                    f"@ {_m['interval']}m interval"
+                                )
+                            for _fname, _r in _fail:
+                                st.caption(f"✗ {_fname}: {_r.get('error')}")
+
+                        _zip_mb = len(_combined.getvalue()) / (1024 * 1024)
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.download_button(
+                                label=f"Download contours_combined.zip ({len(_ok)} shapefiles)",
+                                data=_combined.getvalue(),
+                                file_name="contours_combined.zip",
+                                mime="application/zip",
+                                use_container_width=True,
+                                key="download_contours_batch"
+                            )
+                        with col2:
+                            st.metric("ZIP Size", f"{_zip_mb:.1f} MB")
+
+                        st.info("All shapefiles are in one ZIP. Extract to the same folder before use.")
+
+                    if _fail:
+                        for _fname, _r in _fail:
+                            st.error(f"✗ {_fname}: {_r.get('error', 'Unknown error')}")
 
         else:
             st.error(f"Failed to read TIF file: {metadata_result.get('error', 'Unknown error')}")
@@ -1149,7 +1229,8 @@ with tab4:
 
     tool_choice = st.radio(
         "Tool",
-        ["📐 XYZ → GeoTIFF", "📄 XML → GML", "🗺️ DGM1 Tile Downloader"],
+        ["📐 XYZ → GeoTIFF", "📄 XML → GML",
+         "🗺️ XYZ Tile Downloader", "🏙️ GML/XML Tile Downloader"],
         horizontal=True,
         key="format_tool_choice",
     )
@@ -1397,12 +1478,12 @@ with tab4:
                 **After conversion:** Upload the `.gml` in the **GML → IFC** tab.
                 """)
 
-    # -- DGM1 TILE DOWNLOADER -------------------------------------------------
-    else:
+    # -- XYZ TILE DOWNLOADER --------------------------------------------------
+    elif tool_choice == "🗺️ XYZ Tile Downloader":
         import folium
         from streamlit_folium import st_folium
 
-        st.subheader("DGM1 Tile Downloader")
+        st.subheader("XYZ Tile Downloader")
         st.markdown(
             "Upload a GeoJSON tile index, pick tiles on the interactive map, "
             "then download them as a ZIP of XYZ files ready for the **XYZ → GeoTIFF** tool."
@@ -1658,21 +1739,280 @@ with tab4:
 
         else:
             st.info("Upload the GeoJSON tile index to get started")
-            with st.expander("About DGM1 Tile Downloader"):
+            with st.expander("About XYZ Tile Downloader"):
                 st.markdown("""
-                Download DGM1 elevation tiles from a geodata portal.
+                Download XYZ elevation tiles from a geodata portal.
 
                 **Steps:**
                 1. Download the GeoJSON tile index from your geodata portal
                 2. Upload it here
                 3. Enter a center tile ID (9-digit kachel)
-                4. Click **Select 3x3 grid** or click tiles individually on the map
+                4. Click **Select 3×3 grid** or click tiles individually on the map
                 5. Click **Download XYZ files as ZIP**
                 6. Go to **XYZ → GeoTIFF** and upload the ZIP to batch-convert
 
                 **Tile ID format:** `ZZXXXYYY` (zone 2 + easting km 3 + northing km 4)
                 """)
 
+    # -- GML/XML TILE DOWNLOADER ----------------------------------------------
+    else:
+        import folium
+        from streamlit_folium import st_folium
+
+        st.subheader("GML/XML Tile Downloader")
+        st.markdown(
+            "Upload a GeoJSON tile index, pick tiles on the interactive map, "
+            "then download them as a ZIP of GML/XML files ready for the **XML → GML** or **GML → IFC** tools."
+        )
+
+        uploaded_geojson_gml = st.file_uploader(
+            "Upload GeoJSON tile index",
+            type=["geojson", "json"],
+            help="GeoJSON file from your geodata portal containing tile polygons with download links.",
+            key="gml_tile_geojson",
+        )
+
+        if uploaded_geojson_gml:
+            geojson_bytes_gml = uploaded_geojson_gml.read()
+
+            @st.cache_data(show_spinner="Parsing tile index...")
+            def _parse_gml_index(data: bytes):
+                return parse_tile_index(data)
+
+            tile_index_gml = _parse_gml_index(geojson_bytes_gml)
+            st.success(f"Tile index loaded — {len(tile_index_gml):,} tiles")
+
+            if "gml_tile_selected" not in st.session_state:
+                st.session_state.gml_tile_selected = set()
+            if "gml_tile_center" not in st.session_state:
+                st.session_state.gml_tile_center = ""
+            if "gml_tile_map_center" not in st.session_state:
+                st.session_state.gml_tile_map_center = None
+            if "gml_tile_map_zoom" not in st.session_state:
+                st.session_state.gml_tile_map_zoom = 13
+            if "gml_tile_last_click" not in st.session_state:
+                st.session_state.gml_tile_last_click = None
+
+            st.divider()
+
+            col_c, col_btn, col_clr = st.columns([2, 1, 1])
+            with col_c:
+                gml_center_input = st.text_input(
+                    "Center tile (kachel ID)",
+                    value=st.session_state.gml_tile_center,
+                    key="gml_tile_center_input",
+                    help="9-digit ID: zone(2) + easting_km(3) + northing_km(4)",
+                )
+                if gml_center_input != st.session_state.gml_tile_center:
+                    st.session_state.gml_tile_center = gml_center_input
+                    st.session_state.gml_tile_map_center = None
+                    st.rerun()
+
+            gml_center = st.session_state.gml_tile_center
+
+            with col_btn:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                if st.button("Select 3×3 grid", use_container_width=True, key="gml_tile_auto3x3"):
+                    st.session_state.gml_tile_selected = grid_kachels(gml_center, tile_index_gml, radius=1)
+                    st.rerun()
+
+            with col_clr:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                if st.button("Clear", use_container_width=True, key="gml_tile_clear"):
+                    st.session_state.gml_tile_selected = set()
+                    st.rerun()
+
+            if not gml_center:
+                st.info("Enter a 9-digit kachel ID above to load the map.")
+            elif gml_center not in tile_index_gml:
+                st.warning(f"Tile `{gml_center}` not found in index.")
+            else:
+                if st.session_state.gml_tile_map_center is None:
+                    _lat0, _lon0 = kachel_center_latlon(gml_center)
+                    st.session_state.gml_tile_map_center = [_lat0, _lon0]
+
+                gml_selected = st.session_state.gml_tile_selected
+
+                gml_view_radius = st.slider(
+                    "Map view radius (tiles)", 5, 30, 12, 1,
+                    key="gml_tile_view_radius",
+                )
+
+                gml_view_gj = build_view_geojson(
+                    tile_index_gml, gml_selected, gml_center, radius=gml_view_radius
+                )
+
+                def _gml_tile_style(feature):
+                    k = feature["properties"]["kachel"]
+                    if k in gml_selected:
+                        return {"fillColor": "#2E7D32", "color": "#1B5E20",
+                                "weight": 2, "fillOpacity": 0.65}
+                    elif feature["properties"]["is_center"]:
+                        return {"fillColor": "#F9A825", "color": "#F57F17",
+                                "weight": 2, "fillOpacity": 0.55}
+                    else:
+                        return {"fillColor": "#A5D6A7", "color": "#66BB6A",
+                                "weight": 1, "fillOpacity": 0.20}
+
+                gml_m = folium.Map(
+                    location=st.session_state.gml_tile_map_center,
+                    zoom_start=st.session_state.gml_tile_map_zoom,
+                    tiles="CartoDB positron",
+                )
+                folium.GeoJson(
+                    gml_view_gj,
+                    style_function=_gml_tile_style,
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["kachel", "datum"],
+                        aliases=["Tile ID", "Date"],
+                        style="font-size:12px;",
+                        sticky=True,
+                    ),
+                ).add_to(gml_m)
+
+                st.caption("🖱️ Click a tile to select/deselect. Hover for tile info.")
+                gml_map_out = st_folium(
+                    gml_m,
+                    width="100%",
+                    height=480,
+                    key="gml_tile_map",
+                    returned_objects=["last_clicked", "center", "zoom"],
+                )
+
+                if gml_map_out:
+                    if gml_map_out.get("center"):
+                        st.session_state.gml_tile_map_center = [
+                            gml_map_out["center"]["lat"],
+                            gml_map_out["center"]["lng"],
+                        ]
+                    if gml_map_out.get("zoom"):
+                        st.session_state.gml_tile_map_zoom = gml_map_out["zoom"]
+                    lc = gml_map_out.get("last_clicked")
+                    if lc:
+                        ck = (round(lc["lat"], 7), round(lc["lng"], 7))
+                        if ck != st.session_state.gml_tile_last_click:
+                            st.session_state.gml_tile_last_click = ck
+                            hit = kachel_from_latlon(lc["lat"], lc["lng"], tile_index_gml)
+                            if hit:
+                                if hit in gml_selected:
+                                    st.session_state.gml_tile_selected.discard(hit)
+                                else:
+                                    st.session_state.gml_tile_selected.add(hit)
+                                st.rerun()
+
+                st.divider()
+
+                st.markdown("**3×3 grid around center** — click to toggle:")
+                gml_cells = get_grid_cells(gml_center, tile_index_gml, radius=1)
+                gml_gcols = st.columns(3)
+                for _i, _cell in enumerate(gml_cells):
+                    _k = _cell["kachel"]
+                    _is_sel = _k in gml_selected
+                    _is_ctr = _k == gml_center
+                    with gml_gcols[_i % 3]:
+                        if _cell["available"]:
+                            _pfx = ("★ " if _is_ctr else "") + ("✓ " if _is_sel else "")
+                            _lbl = f"{_pfx}{_k}\n{_cell['datum']}"
+                            if st.button(_lbl, key=f"gml_cell_{_k}", use_container_width=True,
+                                         type="primary" if _is_sel else "secondary"):
+                                if _is_sel:
+                                    st.session_state.gml_tile_selected.discard(_k)
+                                else:
+                                    st.session_state.gml_tile_selected.add(_k)
+                                st.rerun()
+                        else:
+                            st.button(f"❌ {_k}\nn/a", key=f"gml_cell_{_k}",
+                                      disabled=True, use_container_width=True)
+
+                st.divider()
+
+                gml_n_sel = len(gml_selected)
+                if gml_n_sel == 0:
+                    st.info("No tiles selected. Click tiles on the map or use the grid buttons.")
+                else:
+                    st.subheader(f"📥 {gml_n_sel} tile(s) selected")
+                    with st.expander("Selected tiles", expanded=gml_n_sel <= 12):
+                        for _k in sorted(gml_selected):
+                            _inf = tile_index_gml.get(_k, {})
+                            st.caption(f"• **{_k}** — {_inf.get('datum','?')}")
+
+                    if st.button(
+                        f"⬇️ Download {gml_n_sel} file(s) as ZIP",
+                        type="primary",
+                        use_container_width=True,
+                        key="gml_tile_dl_btn",
+                    ):
+                        _klist = sorted(gml_selected)
+                        _prog = st.progress(0.0)
+                        _status = st.empty()
+                        _zbuf = io.BytesIO()
+                        _dl_ok = []
+                        _dl_fail = []
+
+                        with zipfile.ZipFile(_zbuf, "w", zipfile.ZIP_DEFLATED) as _zout:
+                            for _i, _kachel in enumerate(_klist):
+                                _prog.progress(_i / gml_n_sel,
+                                               text=f"Downloading {_kachel} ({_i+1}/{gml_n_sel})...")
+                                _info = tile_index_gml[_kachel]
+                                _url = _info["link_data"]
+                                _fname = (_url.split("file=")[1].split("&")[0]
+                                          if "file=" in _url else f"{_kachel}.gml")
+                                try:
+                                    import requests as _req
+                                    _r = _req.get(_url, timeout=180)
+                                    _r.raise_for_status()
+                                    _zout.writestr(_fname, _r.content)
+                                    _dl_ok.append({"kachel": _kachel, "filename": _fname,
+                                                   "size_kb": len(_r.content) / 1024})
+                                except Exception as _e:
+                                    _dl_fail.append({"kachel": _kachel, "error": str(_e)})
+
+                        _prog.progress(1.0, text="Complete")
+                        _zbuf.seek(0)
+                        _zbytes = _zbuf.getvalue()
+
+                        if _dl_ok:
+                            _zmb = len(_zbytes) / (1024 * 1024)
+                            _status.success(f"Downloaded {len(_dl_ok)} file(s) — {_zmb:.1f} MB ZIP")
+                            st.download_button(
+                                label=f"Save gml_tiles.zip ({len(_dl_ok)} files, {_zmb:.1f} MB)",
+                                data=_zbytes,
+                                file_name="gml_tiles.zip",
+                                mime="application/zip",
+                                use_container_width=True,
+                                key="gml_tile_zip_dl",
+                            )
+                            with st.expander("Download details"):
+                                for _d in _dl_ok:
+                                    st.caption(f"✓ {_d['filename']}  ({_d['size_kb']:.0f} KB)")
+                                for _f in _dl_fail:
+                                    st.caption(f"✗ {_f['kachel']}: {_f['error']}")
+                            st.info(
+                                "If files are **.xml**, use the **📄 XML → GML** tool to rename them, "
+                                "then upload to **GML → IFC**."
+                            )
+                        else:
+                            _status.error("All downloads failed!")
+                            for _f in _dl_fail:
+                                st.error(f"✗ {_f['kachel']}: {_f['error']}")
+
+        else:
+            st.info("Upload the GeoJSON tile index to get started")
+            with st.expander("About GML/XML Tile Downloader"):
+                st.markdown("""
+                Download GML or XML building/feature tiles from a geodata portal.
+
+                **Steps:**
+                1. Download the GeoJSON tile index from your geodata portal
+                2. Upload it here
+                3. Enter a center tile ID (9-digit kachel)
+                4. Click **Select 3×3 grid** or click tiles individually on the map
+                5. Click **Download files as ZIP**
+                6. If files are **.xml**, use **XML → GML** to rename them
+                7. Upload **.gml** files in the **GML → IFC** tab
+
+                **Tile ID format:** `ZZXXXYYY` (zone 2 + easting km 3 + northing km 4)
+                """)
 
 
 # ============================================================================
