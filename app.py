@@ -198,155 +198,158 @@ with tab1:
     # PROCESSING
     if uploaded_files:
         st.divider()
-        st.subheader(f"🔄 Processing {len(uploaded_files)} file(s)")
 
-        # Store converted files
-        converted_files = {}
+        # ── Input fingerprint: changes only when files or settings change ──
+        _boundary_id = (boundary_file.name, boundary_file.size) if boundary_file else None
+        _color_id = tuple(sorted(color_map.items())) if color_map else None
+        _fp = (
+            tuple((f.name, f.size) for f in uploaded_files),
+            merge_files, use_map_conversion,
+            str(input_crs_key), str(output_crs_key),
+            _color_id, split_by_surface, _boundary_id,
+        )
 
-        if merge_files and len(uploaded_files) > 1:
-            # ── MERGED MODE ──
-            info_placeholder = st.empty()
-            try:
-                _m_prog = st.progress(0.0, text="Parsing files...")
-                _m_stat = st.empty()
-                with st.spinner("Merging and converting..."):
-                    gml_file_list = []
-                    for uf in uploaded_files:
-                        gml_file_list.append((uf.name, uf.read()))
+        _cache = st.session_state.get('_gml_cache', {})
+        _cached_files = _cache.get('files') if _cache.get('fp') == _fp else None
 
-                    def _merge_cb(done, total, name):
-                        _m_prog.progress(done / max(total, 1),
-                                         text=f"Building {done+1}/{total} — {name}")
-                        _m_stat.caption(f"▶ {name}")
-
-                    result = convert_gml_files_merged(
-                        gml_file_list=gml_file_list,
-                        use_map_conversion=use_map_conversion,
-                        boundary_polygon=boundary_polygon,
-                        input_crs_key=input_crs_key,
-                        output_crs_key=output_crs_key,
-                        color_map=color_map,
-                        split_by_surface=split_by_surface,
-                        progress_callback=_merge_cb,
-                    )
-                _m_prog.progress(1.0, text="Done")
-                _m_stat.empty()
-
-                if result['success']:
-                    output_filename = "merged_output.ifc"
-                    converted_files[output_filename] = result['ifc_bytes']
-
-                    msg_parts = ["✓ Merged"]
-                    if result.get('kept_buildings', 0) < result.get('total_buildings', 0):
-                        msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
-                    else:
-                        msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
-                    msg_parts.append(f"{result['num_polygons']} polygon(s)")
-                    msg_parts.append(f"{result['epsg_code']}")
-                    info_placeholder.success(" • ".join(msg_parts))
-
-                    if result.get('bounds'):
-                        bounds = result['bounds']
-                        with st.expander("📍 Coordinate Bounds", expanded=False):
-                            col_min, col_max = st.columns(2)
-                            with col_min:
-                                st.metric("Min X", f"{bounds['min'][0]:.2f}")
-                                st.metric("Min Y", f"{bounds['min'][1]:.2f}")
-                                st.metric("Min Z", f"{bounds['min'][2]:.2f}")
-                            with col_max:
-                                st.metric("Max X", f"{bounds['max'][0]:.2f}")
-                                st.metric("Max Y", f"{bounds['max'][1]:.2f}")
-                                st.metric("Max Z", f"{bounds['max'][2]:.2f}")
-                else:
-                    info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
-
-            except Exception as e:
-                info_placeholder.error(f"✗ Error: {str(e)}")
-
-            st.divider()
+        if _cached_files is not None:
+            # ── CACHE HIT: show results without reconverting ──
+            converted_files = _cached_files
         else:
-            # ── PER-FILE MODE ──
-            for idx, uploaded_file in enumerate(uploaded_files, 1):
-                with st.container():
-                    col1, col2 = st.columns([3, 1])
+            # ── CACHE MISS: run conversion ──
+            st.subheader(f"🔄 Processing {len(uploaded_files)} file(s)")
+            converted_files = {}
 
-                    with col1:
-                        st.write(f"**{idx}. {uploaded_file.name}**")
+            if merge_files and len(uploaded_files) > 1:
+                # MERGED MODE
+                info_placeholder = st.empty()
+                try:
+                    _m_prog = st.progress(0.0, text="Parsing files...")
+                    _m_stat = st.empty()
+                    with st.spinner("Merging and converting..."):
+                        gml_file_list = [(uf.name, uf.read()) for uf in uploaded_files]
 
-                    with col2:
-                        file_size = len(uploaded_file.getvalue()) / 1024
-                        st.caption(f"{file_size:.1f} KB")
+                        def _merge_cb(done, total, name):
+                            _m_prog.progress(done / max(total, 1),
+                                             text=f"Building {done+1}/{total} — {name}")
+                            _m_stat.caption(f"▶ {name}")
 
-                    info_placeholder = st.empty()
+                        result = convert_gml_files_merged(
+                            gml_file_list=gml_file_list,
+                            use_map_conversion=use_map_conversion,
+                            boundary_polygon=boundary_polygon,
+                            input_crs_key=input_crs_key,
+                            output_crs_key=output_crs_key,
+                            color_map=color_map,
+                            split_by_surface=split_by_surface,
+                            progress_callback=_merge_cb,
+                        )
+                    _m_prog.progress(1.0, text="Done")
+                    _m_stat.empty()
 
-                    try:
-                        _f_prog = st.progress(0.0, text="Parsing buildings...")
-                        _f_stat = st.empty()
-
-                        def _file_cb(done, total, name, _p=_f_prog, _s=_f_stat):
-                            _p.progress(done / max(total, 1),
-                                        text=f"Building {done+1}/{total} — {name}")
-                            _s.caption(f"▶ {name}")
-
-                        with st.spinner(f"Converting..."):
-                            gml_content = uploaded_file.read()
-
-                            result = convert_gml_to_ifc_bytes(
-                                gml_content=gml_content,
-                                filename=uploaded_file.name,
-                                use_map_conversion=use_map_conversion,
-                                boundary_polygon=boundary_polygon,
-                                input_crs_key=input_crs_key,
-                                output_crs_key=output_crs_key,
-                                color_map=color_map,
-                                split_by_surface=split_by_surface,
-                                progress_callback=_file_cb,
-                            )
-                        _f_prog.progress(1.0, text="Done")
-                        _f_stat.empty()
-
-                        if result['success']:
-                            output_filename = Path(uploaded_file.name).stem + ".ifc"
-                            converted_files[output_filename] = result['ifc_bytes']
-
-                            msg_parts = ["✓ Converted"]
-                            if result.get('total_buildings') and result.get('kept_buildings') is not None:
-                                if result['kept_buildings'] < result['total_buildings']:
-                                    msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
-                                else:
-                                    msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
-                            msg_parts.append(f"{result['num_polygons']} polygon(s)")
-                            msg_parts.append(f"{result['epsg_code']}")
-                            info_placeholder.success(" • ".join(msg_parts))
-
-                            if result.get('bounds'):
-                                bounds = result['bounds']
-                                with st.expander("📍 Coordinate Bounds", expanded=False):
-                                    col_min, col_max = st.columns(2)
-                                    with col_min:
-                                        st.metric("Min X", f"{bounds['min'][0]:.2f}")
-                                        st.metric("Min Y", f"{bounds['min'][1]:.2f}")
-                                        st.metric("Min Z", f"{bounds['min'][2]:.2f}")
-                                    with col_max:
-                                        st.metric("Max X", f"{bounds['max'][0]:.2f}")
-                                        st.metric("Max Y", f"{bounds['max'][1]:.2f}")
-                                        st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                    if result['success']:
+                        converted_files["merged_output.ifc"] = result['ifc_bytes']
+                        msg_parts = ["✓ Merged"]
+                        if result.get('kept_buildings', 0) < result.get('total_buildings', 0):
+                            msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
                         else:
-                            info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
-
-                    except Exception as e:
-                        info_placeholder.error(f"✗ Error: {str(e)}")
-
+                            msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
+                        msg_parts.append(f"{result['num_polygons']} polygon(s)")
+                        msg_parts.append(f"{result['epsg_code']}")
+                        info_placeholder.success(" • ".join(msg_parts))
+                        if result.get('bounds'):
+                            bounds = result['bounds']
+                            with st.expander("📍 Coordinate Bounds", expanded=False):
+                                col_min, col_max = st.columns(2)
+                                with col_min:
+                                    st.metric("Min X", f"{bounds['min'][0]:.2f}")
+                                    st.metric("Min Y", f"{bounds['min'][1]:.2f}")
+                                    st.metric("Min Z", f"{bounds['min'][2]:.2f}")
+                                with col_max:
+                                    st.metric("Max X", f"{bounds['max'][0]:.2f}")
+                                    st.metric("Max Y", f"{bounds['max'][1]:.2f}")
+                                    st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                    else:
+                        info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
+                except Exception as e:
+                    info_placeholder.error(f"✗ Error: {str(e)}")
                 st.divider()
-        
+
+            else:
+                # PER-FILE MODE
+                for idx, uploaded_file in enumerate(uploaded_files, 1):
+                    with st.container():
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.write(f"**{idx}. {uploaded_file.name}**")
+                        with col2:
+                            st.caption(f"{len(uploaded_file.getvalue()) / 1024:.1f} KB")
+
+                        info_placeholder = st.empty()
+                        try:
+                            _f_prog = st.progress(0.0, text="Parsing buildings...")
+                            _f_stat = st.empty()
+
+                            def _file_cb(done, total, name, _p=_f_prog, _s=_f_stat):
+                                _p.progress(done / max(total, 1),
+                                            text=f"Building {done+1}/{total} — {name}")
+                                _s.caption(f"▶ {name}")
+
+                            with st.spinner("Converting..."):
+                                result = convert_gml_to_ifc_bytes(
+                                    gml_content=uploaded_file.read(),
+                                    filename=uploaded_file.name,
+                                    use_map_conversion=use_map_conversion,
+                                    boundary_polygon=boundary_polygon,
+                                    input_crs_key=input_crs_key,
+                                    output_crs_key=output_crs_key,
+                                    color_map=color_map,
+                                    split_by_surface=split_by_surface,
+                                    progress_callback=_file_cb,
+                                )
+                            _f_prog.progress(1.0, text="Done")
+                            _f_stat.empty()
+
+                            if result['success']:
+                                out_fn = Path(uploaded_file.name).stem + ".ifc"
+                                converted_files[out_fn] = result['ifc_bytes']
+                                msg_parts = ["✓ Converted"]
+                                if result.get('total_buildings') and result.get('kept_buildings') is not None:
+                                    if result['kept_buildings'] < result['total_buildings']:
+                                        msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
+                                    else:
+                                        msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
+                                msg_parts.append(f"{result['num_polygons']} polygon(s)")
+                                msg_parts.append(f"{result['epsg_code']}")
+                                info_placeholder.success(" • ".join(msg_parts))
+                                if result.get('bounds'):
+                                    bounds = result['bounds']
+                                    with st.expander("📍 Coordinate Bounds", expanded=False):
+                                        col_min, col_max = st.columns(2)
+                                        with col_min:
+                                            st.metric("Min X", f"{bounds['min'][0]:.2f}")
+                                            st.metric("Min Y", f"{bounds['min'][1]:.2f}")
+                                            st.metric("Min Z", f"{bounds['min'][2]:.2f}")
+                                        with col_max:
+                                            st.metric("Max X", f"{bounds['max'][0]:.2f}")
+                                            st.metric("Max Y", f"{bounds['max'][1]:.2f}")
+                                            st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                            else:
+                                info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
+                        except Exception as e:
+                            info_placeholder.error(f"✗ Error: {str(e)}")
+                    st.divider()
+
+            # Store in cache so download button reruns don't reconvert
+            if converted_files:
+                st.session_state['_gml_cache'] = {'fp': _fp, 'files': converted_files}
+
         # DOWNLOAD SECTION
         if converted_files:
             st.subheader("📥 Download Results")
-            
+
             if len(converted_files) == 1:
-                # Single file download
                 filename, file_bytes = list(converted_files.items())[0]
-                
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     st.download_button(
@@ -357,22 +360,13 @@ with tab1:
                         use_container_width=True
                     )
                 with col2:
-                    size_kb = len(file_bytes) / 1024
-                    st.metric("Size", f"{size_kb:.1f} KB")
-            
+                    st.metric("Size", f"{len(file_bytes) / 1024:.1f} KB")
             else:
-                # Multiple files - create zip
                 zip_buffer = io.BytesIO()
-                total_size = 0
-                
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
                     for filename, file_bytes in converted_files.items():
                         zip_file.writestr(filename, file_bytes)
-                        total_size += len(file_bytes)
-                
                 zip_buffer.seek(0)
-                zip_size_kb = len(zip_buffer.getvalue()) / 1024
-                
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     st.download_button(
@@ -383,9 +377,7 @@ with tab1:
                         use_container_width=True
                     )
                 with col2:
-                    st.metric("ZIP Size", f"{zip_size_kb:.1f} KB")
-                
-                # Individual file downloads
+                    st.metric("ZIP Size", f"{len(zip_buffer.getvalue()) / 1024:.1f} KB")
                 with st.expander("📄 Download Individual Files", expanded=False):
                     for filename, file_bytes in converted_files.items():
                         col1, col2 = st.columns([3, 1])
@@ -399,8 +391,7 @@ with tab1:
                                 use_container_width=True
                             )
                         with col2:
-                            size_kb = len(file_bytes) / 1024
-                            st.caption(f"{size_kb:.1f} KB")
+                            st.caption(f"{len(file_bytes) / 1024:.1f} KB")
 
     else:
         st.info("👆 Upload one or more GML files to get started")
