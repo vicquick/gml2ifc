@@ -8,6 +8,8 @@ import streamlit as st
 from pathlib import Path
 import io
 import zipfile
+import folium
+from streamlit_folium import st_folium
 
 # Import converter functions
 from gml_converter import (
@@ -1560,9 +1562,6 @@ with tab4:
 
     # -- XYZ TILE DOWNLOADER --------------------------------------------------
     elif tool_choice == "🗺️ XYZ Tile Downloader":
-        import folium
-        from streamlit_folium import st_folium
-
         st.subheader("XYZ Tile Downloader")
         st.markdown(
             "Upload a GeoJSON tile index, pick tiles on the interactive map, "
@@ -1836,9 +1835,6 @@ with tab4:
 
     # -- GML/XML TILE DOWNLOADER ----------------------------------------------
     else:
-        import folium
-        from streamlit_folium import st_folium
-
         st.subheader("GML/XML Tile Downloader")
         st.markdown(
             "Upload a GeoJSON tile index, pick tiles on the interactive map, "
