@@ -27,6 +27,21 @@ from wms_fetcher import (
     fetch_wms_elevation_tif,
     extract_shapefile_bbox
 )
+from format_converter import (
+    analyze_xyz,
+    convert_xyz_to_tif,
+    convert_xyz_zip_to_tif_zip,
+    convert_xml_to_gml,
+)
+from tile_downloader import (
+    parse_tile_index,
+    kachel_center_latlon,
+    kachel_from_latlon,
+    get_grid_cells,
+    grid_kachels,
+    build_view_geojson,
+    download_tiles_zip,
+)
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -49,7 +64,7 @@ st.divider()
 # ============================================================================
 # TABS
 # ============================================================================
-tab1, tab2, tab3 = st.tabs(["🏗️ GML → IFC", "📏 TIF → 3D Contour SHP", "🏔️ TIF → 3D Grid SHP"])
+tab1, tab2, tab3, tab4 = st.tabs(["🏗️ GML → IFC", "📏 TIF → 3D Contour SHP", "🏔️ TIF → 3D Grid SHP", "🔄 Format Tools"])
 
 # ============================================================================
 # TAB 1: GML TO IFC
@@ -1123,6 +1138,541 @@ with tab3:
             - CRS reprojection (including LS320 for Hamburg)
             - Import into VW → Create DTM from Source Data
             """)
+
+
+# ============================================================================
+# TAB 4: FORMAT TOOLS  (XYZ->TIF | XML->GML | DGM1 Tile Downloader)
+# ============================================================================
+with tab4:
+    st.subheader("Format Tools")
+    st.markdown("Pre-process raw data files before using them in other tabs")
+
+    tool_choice = st.radio(
+        "Tool",
+        ["📐 XYZ → GeoTIFF", "📄 XML → GML", "🗺️ DGM1 Tile Downloader"],
+        horizontal=True,
+        key="format_tool_choice",
+    )
+
+    st.divider()
+
+    # -- XYZ -> GeoTIFF -------------------------------------------------------
+    if tool_choice == "📐 XYZ → GeoTIFF":
+        st.subheader("XYZ Point Cloud → GeoTIFF")
+        st.markdown(
+            "Convert space-separated **X Y Z** point cloud tiles to float32 GeoTIFF. "
+            "Upload a single **.xyz** file or a **ZIP** of multiple .xyz files."
+        )
+
+        uploaded_xyz = st.file_uploader(
+            "Upload .xyz file or ZIP of .xyz files",
+            type=["xyz", "XYZ", "txt", "zip"],
+            help="Single XYZ file or ZIP from the DGM1 Tile Downloader.",
+            key="xyz_uploader",
+        )
+
+        if uploaded_xyz:
+            is_zip = uploaded_xyz.name.lower().endswith(".zip")
+            xyz_bytes = uploaded_xyz.read()
+            file_size_mb = len(xyz_bytes) / (1024 * 1024)
+
+            st.divider()
+            st.markdown("**Coordinate System:**")
+
+            _default_epsg = 25832
+            if "_33_" in uploaded_xyz.name or "_33." in uploaded_xyz.name:
+                _default_epsg = 25833
+
+            xyz_epsg = st.number_input(
+                "EPSG Code",
+                min_value=1024,
+                max_value=99999,
+                value=_default_epsg,
+                step=1,
+                help="DGM tiles: 25832 (UTM 32N) or 25833 (UTM 33N).",
+                key="xyz_epsg",
+            )
+
+            xyz_nodata = st.number_input(
+                "NoData value for empty pixels",
+                value=-9999.0,
+                step=1.0,
+                format="%.1f",
+                key="xyz_nodata",
+            )
+
+            st.divider()
+
+            if is_zip:
+                import zipfile as _zf_check
+                try:
+                    _names = [n for n in _zf_check.ZipFile(io.BytesIO(xyz_bytes)).namelist()
+                              if n.lower().endswith(".xyz")]
+                    st.info(f"ZIP contains **{len(_names)}** XYZ file(s): {', '.join(_names)}")
+                except Exception as _e:
+                    st.error(f"Cannot read ZIP: {_e}")
+                    _names = []
+
+                if _names and st.button("Convert All to GeoTIFF (ZIP output)", type="primary",
+                                        use_container_width=True, key="xyz_batch_convert"):
+                    prog = st.progress(0.0, text="Starting batch conversion...")
+                    result = convert_xyz_zip_to_tif_zip(
+                        zip_bytes=xyz_bytes,
+                        epsg_code=int(xyz_epsg),
+                        nodata=float(xyz_nodata),
+                    )
+                    prog.progress(1.0, text="Done")
+
+                    if result["success"]:
+                        zip_size_mb = len(result["zip_bytes"]) / (1024 * 1024)
+                        st.success(f"Converted {result['num_success']}/{result['num_total']} files")
+
+                        with st.expander("Results", expanded=True):
+                            for r in result["results"]:
+                                if r["success"]:
+                                    m = r["metadata"]
+                                    st.caption(
+                                        f"✓ {r['output']}  —  "
+                                        f"{m['width']}×{m['height']} px, "
+                                        f"{m['resolution']:.1f}m res, "
+                                        f"Z {m['elevation_range']['min']:.1f}–{m['elevation_range']['max']:.1f} m"
+                                    )
+                                else:
+                                    st.caption(f"✗ {r['input']}: {r.get('error')}")
+
+                        out_name = Path(uploaded_xyz.name).stem + "_tif.zip"
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.download_button(
+                                label=f"Download {out_name} ({result['num_success']} GeoTIFFs)",
+                                data=result["zip_bytes"],
+                                file_name=out_name,
+                                mime="application/zip",
+                                use_container_width=True,
+                                key="xyz_batch_download",
+                            )
+                        with col2:
+                            st.metric("ZIP Size", f"{zip_size_mb:.1f} MB")
+
+                        st.info("Upload individual TIF files in the TIF converter tabs.")
+                    else:
+                        st.error(f"Batch conversion failed: {result.get('error')}")
+
+            else:
+                with st.spinner("Analyzing point cloud..."):
+                    info = analyze_xyz(xyz_bytes)
+
+                if info["success"]:
+                    st.success(f"Loaded {info['num_points']:,} points")
+
+                    with st.expander("Point Cloud Info", expanded=True):
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Points", f"{info['num_points']:,}")
+                            st.metric("Resolution", f"{info['resolution']:.3f} m")
+                        with col2:
+                            st.metric("Grid Width", f"{info['width']} px")
+                            st.metric("Grid Height", f"{info['height']} px")
+                        with col3:
+                            st.metric("File Size", f"{file_size_mb:.1f} MB")
+                        st.markdown("**Elevation Range:**")
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.metric("Min Z", f"{info['elevation_range']['min']:.2f} m")
+                        with c2:
+                            st.metric("Mean Z", f"{info['elevation_range']['mean']:.2f} m")
+                        with c3:
+                            st.metric("Max Z", f"{info['elevation_range']['max']:.2f} m")
+                        st.caption(
+                            f"X: {info['x_min']:.2f} → {info['x_max']:.2f}  |  "
+                            f"Y: {info['y_min']:.2f} → {info['y_max']:.2f}"
+                        )
+
+                    if st.button("Convert to GeoTIFF", type="primary", use_container_width=True, key="xyz_convert"):
+                        with st.spinner(f"Rasterizing {info['num_points']:,} points..."):
+                            result = convert_xyz_to_tif(
+                                xyz_bytes=xyz_bytes,
+                                epsg_code=int(xyz_epsg),
+                                nodata=float(xyz_nodata),
+                            )
+                        if result["success"]:
+                            meta = result["metadata"]
+                            tif_size_mb = len(result["tif_bytes"]) / (1024 * 1024)
+                            st.success(
+                                f"GeoTIFF created — {meta['width']}×{meta['height']} px, "
+                                f"EPSG:{meta['epsg_code']}, {tif_size_mb:.1f} MB"
+                            )
+                            out_name = Path(uploaded_xyz.name).stem + ".tif"
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.download_button(
+                                    label=f"Download {out_name}",
+                                    data=result["tif_bytes"],
+                                    file_name=out_name,
+                                    mime="image/tiff",
+                                    use_container_width=True,
+                                    key="xyz_download",
+                                )
+                            with col2:
+                                st.metric("Size", f"{tif_size_mb:.1f} MB")
+                            st.info("Upload this TIF in the TIF converter tabs.")
+                        else:
+                            st.error(f"Conversion failed: {result.get('error')}")
+                else:
+                    st.error(f"Failed to read XYZ file: {info.get('error')}")
+
+        else:
+            st.info("Upload an .xyz file or a ZIP of .xyz files to get started")
+            with st.expander("About XYZ → GeoTIFF"):
+                st.markdown("""
+                Converts regular-grid XYZ point clouds to float32 GeoTIFF.
+
+                **Inputs:**
+                - Single `.xyz`: space-separated X Y Z, one point per line
+                - ZIP of `.xyz` files: batch-converts all, outputs a ZIP of TIFs
+
+                Auto-detects resolution from point spacing and EPSG from filename.
+                Output: LZW-compressed float32 GeoTIFF.
+                """)
+
+    # -- XML -> GML -----------------------------------------------------------
+    elif tool_choice == "📄 XML → GML":
+        st.subheader("XML → GML (CityGML rename)")
+        st.markdown(
+            "CityGML building data is sometimes delivered with an `.xml` extension. "
+            "This tool validates the file and provides it as `.gml` — "
+            "**content is byte-identical to the source**."
+        )
+
+        uploaded_xml = st.file_uploader(
+            "Upload .xml file",
+            type=["xml", "XML"],
+            help="CityGML file with .xml extension (e.g. LoD2 building tiles from open geodata portals).",
+            key="xml_uploader",
+        )
+
+        if uploaded_xml:
+            xml_bytes = uploaded_xml.read()
+            file_size_kb = len(xml_bytes) / 1024
+
+            with st.spinner("Validating XML..."):
+                result = convert_xml_to_gml(xml_bytes)
+
+            if result["success"]:
+                st.success("Valid XML — ready for download as .gml")
+                with st.expander("File Info", expanded=True):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("File Size", f"{file_size_kb:.1f} KB")
+                    with col2:
+                        st.metric("City Objects", result["num_members"])
+                    with col3:
+                        st.metric("CityGML", "Yes" if result["is_citygml"] else "No")
+                    st.caption(f"Root element: {result['root_tag']}")
+
+                out_name = Path(uploaded_xml.name).stem + ".gml"
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.download_button(
+                        label=f"Download {out_name}",
+                        data=result["gml_bytes"],
+                        file_name=out_name,
+                        mime="application/gml+xml",
+                        use_container_width=True,
+                        key="xml_download",
+                    )
+                with col2:
+                    st.metric("Size", f"{file_size_kb:.1f} KB")
+
+                st.info(f"`{out_name}` is byte-identical to the source. Upload in **GML → IFC** tab.")
+            else:
+                st.error(f"Validation failed: {result.get('error')}")
+        else:
+            st.info("Upload a CityGML .xml file to get started")
+            with st.expander("About XML → GML"):
+                st.markdown("""
+                CityGML files from some open geodata portals are distributed with `.xml`
+                instead of `.gml`. Both are identical. This tool validates and renames.
+                No data is modified.
+                **After conversion:** Upload the `.gml` in the **GML → IFC** tab.
+                """)
+
+    # -- DGM1 TILE DOWNLOADER -------------------------------------------------
+    else:
+        import folium
+        from streamlit_folium import st_folium
+
+        st.subheader("DGM1 Tile Downloader")
+        st.markdown(
+            "Upload a GeoJSON tile index, pick tiles on the interactive map, "
+            "then download them as a ZIP of XYZ files ready for the **XYZ → GeoTIFF** tool."
+        )
+
+        uploaded_geojson = st.file_uploader(
+            "Upload GeoJSON tile index",
+            type=["geojson", "json"],
+            help="GeoJSON file from your geodata portal containing tile polygons with download links.",
+            key="dgm1_geojson",
+        )
+
+        if uploaded_geojson:
+            geojson_bytes = uploaded_geojson.read()
+
+            @st.cache_data(show_spinner="Parsing tile index...")
+            def _parse_index(data: bytes):
+                return parse_tile_index(data)
+
+            tile_index = _parse_index(geojson_bytes)
+            st.success(f"Tile index loaded — {len(tile_index):,} tiles")
+
+            # session state init
+            if "dgm1_selected" not in st.session_state:
+                st.session_state.dgm1_selected = set()
+            if "dgm1_center" not in st.session_state:
+                st.session_state.dgm1_center = ""
+            if "dgm1_map_center" not in st.session_state:
+                st.session_state.dgm1_map_center = None
+            if "dgm1_map_zoom" not in st.session_state:
+                st.session_state.dgm1_map_zoom = 13
+            if "dgm1_last_click" not in st.session_state:
+                st.session_state.dgm1_last_click = None
+
+            st.divider()
+
+            col_c, col_btn, col_clr = st.columns([2, 1, 1])
+            with col_c:
+                center_input = st.text_input(
+                    "Center tile (kachel ID)",
+                    value=st.session_state.dgm1_center,
+                    key="dgm1_center_input",
+                    help="9-digit ID: zone(2) + easting_km(3) + northing_km(4), e.g. 326226017",
+                )
+                if center_input != st.session_state.dgm1_center:
+                    st.session_state.dgm1_center = center_input
+                    st.session_state.dgm1_map_center = None
+                    st.rerun()
+
+            center_kachel = st.session_state.dgm1_center
+
+            with col_btn:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                if st.button("Select 3×3 grid", use_container_width=True, key="dgm1_auto3x3"):
+                    st.session_state.dgm1_selected = grid_kachels(center_kachel, tile_index, radius=1)
+                    st.rerun()
+
+            with col_clr:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                if st.button("Clear", use_container_width=True, key="dgm1_clear"):
+                    st.session_state.dgm1_selected = set()
+                    st.rerun()
+
+            if not center_kachel:
+                st.info("Enter a 9-digit kachel ID above to load the map.")
+            elif center_kachel not in tile_index:
+                st.warning(f"Tile `{center_kachel}` not found in index.")
+            else:
+                if st.session_state.dgm1_map_center is None:
+                    lat0, lon0 = kachel_center_latlon(center_kachel)
+                    st.session_state.dgm1_map_center = [lat0, lon0]
+
+                selected = st.session_state.dgm1_selected
+
+                view_radius = st.slider(
+                    "Map view radius (tiles)", 5, 30, 12, 1,
+                    help="How many km around center to render",
+                    key="dgm1_view_radius",
+                )
+
+                view_gj = build_view_geojson(tile_index, selected, center_kachel, radius=view_radius)
+
+                def _tile_style(feature):
+                    k = feature["properties"]["kachel"]
+                    if k in selected:
+                        return {"fillColor": "#1565C0", "color": "#0D47A1",
+                                "weight": 2, "fillOpacity": 0.65}
+                    elif feature["properties"]["is_center"]:
+                        return {"fillColor": "#F9A825", "color": "#F57F17",
+                                "weight": 2, "fillOpacity": 0.55}
+                    else:
+                        return {"fillColor": "#90CAF9", "color": "#64B5F6",
+                                "weight": 1, "fillOpacity": 0.20}
+
+                m = folium.Map(
+                    location=st.session_state.dgm1_map_center,
+                    zoom_start=st.session_state.dgm1_map_zoom,
+                    tiles="CartoDB positron",
+                )
+
+                folium.GeoJson(
+                    view_gj,
+                    style_function=_tile_style,
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["kachel", "datum"],
+                        aliases=["Tile ID", "Date"],
+                        style="font-size:12px;",
+                        sticky=True,
+                    ),
+                ).add_to(m)
+
+                st.caption("🖱️ Click a tile to select/deselect. Hover for tile info.")
+                map_out = st_folium(
+                    m,
+                    width="100%",
+                    height=480,
+                    key="dgm1_map",
+                    returned_objects=["last_clicked", "center", "zoom"],
+                )
+
+                if map_out:
+                    if map_out.get("center"):
+                        st.session_state.dgm1_map_center = [
+                            map_out["center"]["lat"],
+                            map_out["center"]["lng"],
+                        ]
+                    if map_out.get("zoom"):
+                        st.session_state.dgm1_map_zoom = map_out["zoom"]
+
+                    lc = map_out.get("last_clicked")
+                    if lc:
+                        click_key = (round(lc["lat"], 7), round(lc["lng"], 7))
+                        if click_key != st.session_state.dgm1_last_click:
+                            st.session_state.dgm1_last_click = click_key
+                            hit = kachel_from_latlon(lc["lat"], lc["lng"], tile_index)
+                            if hit:
+                                if hit in st.session_state.dgm1_selected:
+                                    st.session_state.dgm1_selected.discard(hit)
+                                else:
+                                    st.session_state.dgm1_selected.add(hit)
+                                st.rerun()
+
+                st.divider()
+
+                # tic-tac-toe 3x3 grid
+                st.markdown("**3×3 grid around center** — click to toggle:")
+                cells = get_grid_cells(center_kachel, tile_index, radius=1)
+                grid_cols = st.columns(3)
+                for i, cell in enumerate(cells):
+                    k = cell["kachel"]
+                    is_sel = k in selected
+                    is_ctr = k == center_kachel
+                    with grid_cols[i % 3]:
+                        if cell["available"]:
+                            prefix = ("★ " if is_ctr else "") + ("✓ " if is_sel else "")
+                            label = f"{prefix}{k}\n{cell['datum']}"
+                            btype = "primary" if is_sel else "secondary"
+                            if st.button(label, key=f"cell_{k}", use_container_width=True, type=btype):
+                                if is_sel:
+                                    st.session_state.dgm1_selected.discard(k)
+                                else:
+                                    st.session_state.dgm1_selected.add(k)
+                                st.rerun()
+                        else:
+                            st.button(f"❌ {k}\nn/a", key=f"cell_{k}",
+                                      disabled=True, use_container_width=True)
+
+                st.divider()
+
+                n_sel = len(selected)
+                if n_sel == 0:
+                    st.info("No tiles selected. Click tiles on the map or use the grid buttons above.")
+                else:
+                    st.subheader(f"📥 {n_sel} tile(s) selected")
+                    with st.expander("Selected tiles", expanded=n_sel <= 12):
+                        for k in sorted(selected):
+                            info = tile_index.get(k, {})
+                            st.caption(f"• **{k}** — {info.get('datum','?')}")
+
+                    est_mb = n_sel * 27
+                    zip_est_mb = n_sel * 6
+                    st.caption(f"Estimated: ~{est_mb} MB raw, ~{zip_est_mb} MB zipped")
+
+                    if st.button(
+                        f"⬇️ Download {n_sel} XYZ file(s) as ZIP",
+                        type="primary",
+                        use_container_width=True,
+                        key="dgm1_download_btn",
+                    ):
+                        kachel_list = sorted(selected)
+                        prog_bar = st.progress(0.0)
+                        status_ph = st.empty()
+                        zip_buf = io.BytesIO()
+                        downloaded_list = []
+                        failed_list = []
+
+                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf_out:
+                            for i, kachel in enumerate(kachel_list):
+                                prog_bar.progress(
+                                    i / n_sel,
+                                    text=f"Downloading {kachel} ({i+1}/{n_sel})...",
+                                )
+                                status_ph.text(f"Fetching {kachel}...")
+                                info = tile_index[kachel]
+                                url = info["link_data"]
+                                fname = (url.split("file=")[1].split("&")[0]
+                                         if "file=" in url else f"dgm1_{kachel}.xyz")
+                                try:
+                                    import requests as _req
+                                    r = _req.get(url, timeout=180)
+                                    r.raise_for_status()
+                                    zf_out.writestr(fname, r.content)
+                                    downloaded_list.append({
+                                        "kachel": kachel,
+                                        "filename": fname,
+                                        "size_mb": len(r.content) / 1024 / 1024,
+                                    })
+                                except Exception as e:
+                                    failed_list.append({"kachel": kachel, "error": str(e)})
+
+                        prog_bar.progress(1.0, text="Complete")
+                        zip_buf.seek(0)
+                        zip_bytes_out = zip_buf.getvalue()
+
+                        if downloaded_list:
+                            total_raw = sum(d["size_mb"] for d in downloaded_list)
+                            zip_mb = len(zip_bytes_out) / (1024 * 1024)
+                            status_ph.success(
+                                f"Downloaded {len(downloaded_list)} file(s) — "
+                                f"{total_raw:.0f} MB raw → {zip_mb:.1f} MB ZIP"
+                            )
+                            st.download_button(
+                                label=f"Save dgm1_tiles.zip ({len(downloaded_list)} files, {zip_mb:.1f} MB)",
+                                data=zip_bytes_out,
+                                file_name="dgm1_tiles.zip",
+                                mime="application/zip",
+                                use_container_width=True,
+                                key="dgm1_zip_dl",
+                            )
+                            with st.expander("Download details"):
+                                for d in downloaded_list:
+                                    st.caption(f"✓ {d['filename']}  ({d['size_mb']:.1f} MB)")
+                                for f in failed_list:
+                                    st.caption(f"✗ {f['kachel']}: {f['error']}")
+                            st.info(
+                                "Upload **dgm1_tiles.zip** in the **📐 XYZ → GeoTIFF** tool "
+                                "to batch-convert all tiles to GeoTIFF."
+                            )
+                        else:
+                            status_ph.error("All downloads failed!")
+                            for f in failed_list:
+                                st.error(f"✗ {f['kachel']}: {f['error']}")
+
+        else:
+            st.info("Upload the GeoJSON tile index to get started")
+            with st.expander("About DGM1 Tile Downloader"):
+                st.markdown("""
+                Download DGM1 elevation tiles from a geodata portal.
+
+                **Steps:**
+                1. Download the GeoJSON tile index from your geodata portal
+                2. Upload it here
+                3. Enter a center tile ID (9-digit kachel)
+                4. Click **Select 3x3 grid** or click tiles individually on the map
+                5. Click **Download XYZ files as ZIP**
+                6. Go to **XYZ → GeoTIFF** and upload the ZIP to batch-convert
+
+                **Tile ID format:** `ZZXXXYYY` (zone 2 + easting km 3 + northing km 4)
+                """)
+
 
 
 # ============================================================================
