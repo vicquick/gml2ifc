@@ -1426,56 +1426,115 @@ with tab4:
         )
 
         uploaded_xml = st.file_uploader(
-            "Upload .xml file",
-            type=["xml", "XML"],
-            help="CityGML file with .xml extension (e.g. LoD2 building tiles from open geodata portals).",
+            "Upload .xml file(s) or a ZIP of .xml files",
+            type=["xml", "XML", "zip"],
+            accept_multiple_files=True,
+            help="Single or multiple XML files, or a ZIP containing .xml files.",
             key="xml_uploader",
         )
 
         if uploaded_xml:
-            xml_bytes = uploaded_xml.read()
-            file_size_kb = len(xml_bytes) / 1024
+            # Collect (name, bytes) pairs from both direct uploads and ZIPs
+            xml_files = []
+            for _f in uploaded_xml:
+                if _f.name.lower().endswith(".zip"):
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(_f.getvalue())) as _zf:
+                            for _n in _zf.namelist():
+                                if _n.lower().endswith(".xml"):
+                                    xml_files.append((_n, _zf.read(_n)))
+                    except Exception as _ze:
+                        st.error(f"Cannot read ZIP {_f.name}: {_ze}")
+                else:
+                    xml_files.append((_f.name, _f.getvalue()))
 
-            with st.spinner("Validating XML..."):
-                result = convert_xml_to_gml(xml_bytes)
+            if xml_files:
+                if len(xml_files) == 1:
+                    # ── SINGLE FILE ──
+                    _name, _bytes = xml_files[0]
+                    file_size_kb = len(_bytes) / 1024
+                    with st.spinner("Validating XML..."):
+                        result = convert_xml_to_gml(_bytes)
+                    if result["success"]:
+                        st.success("Valid XML — ready for download as .gml")
+                        with st.expander("File Info", expanded=True):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("File Size", f"{file_size_kb:.1f} KB")
+                            with col2:
+                                st.metric("City Objects", result["num_members"])
+                            with col3:
+                                st.metric("CityGML", "Yes" if result["is_citygml"] else "No")
+                            st.caption(f"Root element: {result['root_tag']}")
+                        out_name = Path(_name).stem + ".gml"
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.download_button(
+                                label=f"Download {out_name}",
+                                data=result["gml_bytes"],
+                                file_name=out_name,
+                                mime="application/gml+xml",
+                                use_container_width=True,
+                                key="xml_download",
+                            )
+                        with col2:
+                            st.metric("Size", f"{file_size_kb:.1f} KB")
+                        st.info(f"`{out_name}` is byte-identical to the source. Upload in **GML → IFC** tab.")
+                    else:
+                        st.error(f"Validation failed: {result.get('error')}")
 
-            if result["success"]:
-                st.success("Valid XML — ready for download as .gml")
-                with st.expander("File Info", expanded=True):
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("File Size", f"{file_size_kb:.1f} KB")
-                    with col2:
-                        st.metric("City Objects", result["num_members"])
-                    with col3:
-                        st.metric("CityGML", "Yes" if result["is_citygml"] else "No")
-                    st.caption(f"Root element: {result['root_tag']}")
+                else:
+                    # ── BATCH MODE ──
+                    st.info(f"**{len(xml_files)} XML files** loaded. Validating and renaming all to .gml.")
+                    with st.spinner(f"Processing {len(xml_files)} files..."):
+                        _ok = []
+                        _fail = []
+                        _zip_buf = io.BytesIO()
+                        with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zout:
+                            for _name, _bytes in xml_files:
+                                _r = convert_xml_to_gml(_bytes)
+                                _gml_name = Path(_name).stem + ".gml"
+                                if _r["success"]:
+                                    _zout.writestr(_gml_name, _r["gml_bytes"])
+                                    _ok.append({"name": _gml_name, "members": _r["num_members"],
+                                                "size_kb": len(_bytes) / 1024})
+                                else:
+                                    _fail.append({"name": _name, "error": _r.get("error")})
 
-                out_name = Path(uploaded_xml.name).stem + ".gml"
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.download_button(
-                        label=f"Download {out_name}",
-                        data=result["gml_bytes"],
-                        file_name=out_name,
-                        mime="application/gml+xml",
-                        use_container_width=True,
-                        key="xml_download",
-                    )
-                with col2:
-                    st.metric("Size", f"{file_size_kb:.1f} KB")
+                    if _ok:
+                        st.success(f"Converted {len(_ok)}/{len(xml_files)} files")
+                        with st.expander("Results", expanded=True):
+                            for _d in _ok:
+                                st.caption(f"✓ {_d['name']}  ({_d['members']} city objects, {_d['size_kb']:.0f} KB)")
+                            for _d in _fail:
+                                st.caption(f"✗ {_d['name']}: {_d['error']}")
 
-                st.info(f"`{out_name}` is byte-identical to the source. Upload in **GML → IFC** tab.")
-            else:
-                st.error(f"Validation failed: {result.get('error')}")
+                        _zip_buf.seek(0)
+                        _zip_mb = len(_zip_buf.getvalue()) / (1024 * 1024)
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.download_button(
+                                label=f"Download gml_files.zip ({len(_ok)} .gml files)",
+                                data=_zip_buf.getvalue(),
+                                file_name="gml_files.zip",
+                                mime="application/zip",
+                                use_container_width=True,
+                                key="xml_batch_download",
+                            )
+                        with col2:
+                            st.metric("ZIP Size", f"{_zip_mb:.1f} MB")
+                        st.info("All .gml files are byte-identical to their sources. Upload in **GML → IFC** tab.")
+                    for _d in _fail:
+                        st.error(f"✗ {_d['name']}: {_d['error']}")
+
         else:
-            st.info("Upload a CityGML .xml file to get started")
+            st.info("Upload a .xml file, multiple .xml files, or a ZIP of .xml files to get started")
             with st.expander("About XML → GML"):
                 st.markdown("""
                 CityGML files from some open geodata portals are distributed with `.xml`
                 instead of `.gml`. Both are identical. This tool validates and renames.
-                No data is modified.
-                **After conversion:** Upload the `.gml` in the **GML → IFC** tab.
+                No data is modified. Accepts single file, multiple files, or a ZIP.
+                **After conversion:** Upload the `.gml` file(s) in the **GML → IFC** tab.
                 """)
 
     # -- XYZ TILE DOWNLOADER --------------------------------------------------
