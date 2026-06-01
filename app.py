@@ -1498,12 +1498,12 @@ with tab4:
 
         if uploaded_geojson:
             geojson_bytes = uploaded_geojson.getvalue()
-
-            @st.cache_data(show_spinner="Parsing tile index...")
-            def _parse_index(data: bytes):
-                return parse_tile_index(data)
-
-            tile_index = _parse_index(geojson_bytes)
+            _xyz_file_id = (uploaded_geojson.name, len(geojson_bytes))
+            if st.session_state.get("_xyz_tile_file_id") != _xyz_file_id:
+                with st.spinner("Parsing tile index..."):
+                    st.session_state["_xyz_tile_file_id"] = _xyz_file_id
+                    st.session_state["_xyz_tile_index"] = parse_tile_index(geojson_bytes)
+            tile_index = st.session_state["_xyz_tile_index"]
             st.success(f"Tile index loaded — {len(tile_index):,} tiles")
 
             # session state init
@@ -1774,12 +1774,12 @@ with tab4:
 
         if uploaded_geojson_gml:
             geojson_bytes_gml = uploaded_geojson_gml.getvalue()
-
-            @st.cache_data(show_spinner="Parsing tile index...")
-            def _parse_gml_index(data: bytes):
-                return parse_tile_index(data)
-
-            tile_index_gml = _parse_gml_index(geojson_bytes_gml)
+            _gml_file_id = (uploaded_geojson_gml.name, len(geojson_bytes_gml))
+            if st.session_state.get("_gml_tile_file_id") != _gml_file_id:
+                with st.spinner("Parsing tile index..."):
+                    st.session_state["_gml_tile_file_id"] = _gml_file_id
+                    st.session_state["_gml_tile_index"] = parse_tile_index(geojson_bytes_gml)
+            tile_index_gml = st.session_state["_gml_tile_index"]
             st.success(f"Tile index loaded — {len(tile_index_gml):,} tiles")
 
             if "gml_tile_selected" not in st.session_state:
