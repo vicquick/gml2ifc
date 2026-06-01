@@ -698,7 +698,8 @@ def detect_surface_types(gml_contents):
 def convert_gml_to_ifc_bytes(gml_content, filename, default_epsg=25832,
                               use_map_conversion=False, boundary_polygon=None,
                               input_crs_key=None, output_crs_key=None,
-                              color_map=None, split_by_surface=False):
+                              color_map=None, split_by_surface=False,
+                              progress_callback=None):
     """
     Convert GML content to IFC and return as bytes with metadata.
 
@@ -777,9 +778,13 @@ def convert_gml_to_ifc_bytes(gml_content, filename, default_epsg=25832,
         element_stem = Path(filename).stem
         element_count = 0
         style_cache = {}
-        for bldg in buildings:
-            bldg_name = bldg['name'] if len(buildings) > 1 else element_stem
-            bldg['name'] = bldg_name  # ensure name is set for split helper
+        total_bldgs = len(buildings)
+        for bldg_idx, bldg in enumerate(buildings):
+            bldg_name = bldg['name'] if total_bldgs > 1 else element_stem
+            bldg['name'] = bldg_name
+
+            if progress_callback:
+                progress_callback(bldg_idx, total_bldgs, bldg_name)
 
             if split_by_surface and color_map:
                 element_count += create_building_split_by_surface(
@@ -836,7 +841,8 @@ def convert_gml_to_ifc_bytes(gml_content, filename, default_epsg=25832,
 def convert_gml_files_merged(gml_file_list, use_map_conversion=False,
                               boundary_polygon=None, input_crs_key=None,
                               output_crs_key=None, color_map=None,
-                              default_epsg=25832, split_by_surface=False):
+                              default_epsg=25832, split_by_surface=False,
+                              progress_callback=None):
     """Convert multiple GML files into a single merged IFC.
 
     Args:
@@ -917,7 +923,10 @@ def convert_gml_files_merged(gml_file_list, use_map_conversion=False,
 
         style_cache = {}
         element_count = 0
-        for bldg in all_buildings:
+        total_all = len(all_buildings)
+        for bldg_idx, bldg in enumerate(all_buildings):
+            if progress_callback:
+                progress_callback(bldg_idx, total_all, bldg.get('name', ''))
             if split_by_surface and color_map:
                 element_count += create_building_split_by_surface(
                     ifc_file, site, context, bldg, color_map, style_cache

@@ -205,10 +205,17 @@ with tab1:
             # ── MERGED MODE ──
             info_placeholder = st.empty()
             try:
+                _m_prog = st.progress(0.0, text="Parsing files...")
+                _m_stat = st.empty()
                 with st.spinner("Merging and converting..."):
                     gml_file_list = []
                     for uf in uploaded_files:
                         gml_file_list.append((uf.name, uf.read()))
+
+                    def _merge_cb(done, total, name):
+                        _m_prog.progress(done / max(total, 1),
+                                         text=f"Building {done+1}/{total} — {name}")
+                        _m_stat.caption(f"▶ {name}")
 
                     result = convert_gml_files_merged(
                         gml_file_list=gml_file_list,
@@ -218,35 +225,38 @@ with tab1:
                         output_crs_key=output_crs_key,
                         color_map=color_map,
                         split_by_surface=split_by_surface,
+                        progress_callback=_merge_cb,
                     )
+                _m_prog.progress(1.0, text="Done")
+                _m_stat.empty()
 
-                    if result['success']:
-                        output_filename = "merged_output.ifc"
-                        converted_files[output_filename] = result['ifc_bytes']
+                if result['success']:
+                    output_filename = "merged_output.ifc"
+                    converted_files[output_filename] = result['ifc_bytes']
 
-                        msg_parts = ["✓ Merged"]
-                        if result.get('kept_buildings', 0) < result.get('total_buildings', 0):
-                            msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
-                        else:
-                            msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
-                        msg_parts.append(f"{result['num_polygons']} polygon(s)")
-                        msg_parts.append(f"{result['epsg_code']}")
-                        info_placeholder.success(" • ".join(msg_parts))
-
-                        if result.get('bounds'):
-                            bounds = result['bounds']
-                            with st.expander("📍 Coordinate Bounds", expanded=False):
-                                col_min, col_max = st.columns(2)
-                                with col_min:
-                                    st.metric("Min X", f"{bounds['min'][0]:.2f}")
-                                    st.metric("Min Y", f"{bounds['min'][1]:.2f}")
-                                    st.metric("Min Z", f"{bounds['min'][2]:.2f}")
-                                with col_max:
-                                    st.metric("Max X", f"{bounds['max'][0]:.2f}")
-                                    st.metric("Max Y", f"{bounds['max'][1]:.2f}")
-                                    st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                    msg_parts = ["✓ Merged"]
+                    if result.get('kept_buildings', 0) < result.get('total_buildings', 0):
+                        msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
                     else:
-                        info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
+                        msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
+                    msg_parts.append(f"{result['num_polygons']} polygon(s)")
+                    msg_parts.append(f"{result['epsg_code']}")
+                    info_placeholder.success(" • ".join(msg_parts))
+
+                    if result.get('bounds'):
+                        bounds = result['bounds']
+                        with st.expander("📍 Coordinate Bounds", expanded=False):
+                            col_min, col_max = st.columns(2)
+                            with col_min:
+                                st.metric("Min X", f"{bounds['min'][0]:.2f}")
+                                st.metric("Min Y", f"{bounds['min'][1]:.2f}")
+                                st.metric("Min Z", f"{bounds['min'][2]:.2f}")
+                            with col_max:
+                                st.metric("Max X", f"{bounds['max'][0]:.2f}")
+                                st.metric("Max Y", f"{bounds['max'][1]:.2f}")
+                                st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                else:
+                    info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
 
             except Exception as e:
                 info_placeholder.error(f"✗ Error: {str(e)}")
@@ -268,6 +278,14 @@ with tab1:
                     info_placeholder = st.empty()
 
                     try:
+                        _f_prog = st.progress(0.0, text="Parsing buildings...")
+                        _f_stat = st.empty()
+
+                        def _file_cb(done, total, name, _p=_f_prog, _s=_f_stat):
+                            _p.progress(done / max(total, 1),
+                                        text=f"Building {done+1}/{total} — {name}")
+                            _s.caption(f"▶ {name}")
+
                         with st.spinner(f"Converting..."):
                             gml_content = uploaded_file.read()
 
@@ -280,36 +298,39 @@ with tab1:
                                 output_crs_key=output_crs_key,
                                 color_map=color_map,
                                 split_by_surface=split_by_surface,
+                                progress_callback=_file_cb,
                             )
+                        _f_prog.progress(1.0, text="Done")
+                        _f_stat.empty()
 
-                            if result['success']:
-                                output_filename = Path(uploaded_file.name).stem + ".ifc"
-                                converted_files[output_filename] = result['ifc_bytes']
+                        if result['success']:
+                            output_filename = Path(uploaded_file.name).stem + ".ifc"
+                            converted_files[output_filename] = result['ifc_bytes']
 
-                                msg_parts = ["✓ Converted"]
-                                if result.get('total_buildings') and result.get('kept_buildings') is not None:
-                                    if result['kept_buildings'] < result['total_buildings']:
-                                        msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
-                                    else:
-                                        msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
-                                msg_parts.append(f"{result['num_polygons']} polygon(s)")
-                                msg_parts.append(f"{result['epsg_code']}")
-                                info_placeholder.success(" • ".join(msg_parts))
+                            msg_parts = ["✓ Converted"]
+                            if result.get('total_buildings') and result.get('kept_buildings') is not None:
+                                if result['kept_buildings'] < result['total_buildings']:
+                                    msg_parts.append(f"kept {result['kept_buildings']} of {result['total_buildings']} buildings")
+                                else:
+                                    msg_parts.append(f"{result.get('num_buildings', '?')} building(s)")
+                            msg_parts.append(f"{result['num_polygons']} polygon(s)")
+                            msg_parts.append(f"{result['epsg_code']}")
+                            info_placeholder.success(" • ".join(msg_parts))
 
-                                if result.get('bounds'):
-                                    bounds = result['bounds']
-                                    with st.expander("📍 Coordinate Bounds", expanded=False):
-                                        col_min, col_max = st.columns(2)
-                                        with col_min:
-                                            st.metric("Min X", f"{bounds['min'][0]:.2f}")
-                                            st.metric("Min Y", f"{bounds['min'][1]:.2f}")
-                                            st.metric("Min Z", f"{bounds['min'][2]:.2f}")
-                                        with col_max:
-                                            st.metric("Max X", f"{bounds['max'][0]:.2f}")
-                                            st.metric("Max Y", f"{bounds['max'][1]:.2f}")
-                                            st.metric("Max Z", f"{bounds['max'][2]:.2f}")
-                            else:
-                                info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
+                            if result.get('bounds'):
+                                bounds = result['bounds']
+                                with st.expander("📍 Coordinate Bounds", expanded=False):
+                                    col_min, col_max = st.columns(2)
+                                    with col_min:
+                                        st.metric("Min X", f"{bounds['min'][0]:.2f}")
+                                        st.metric("Min Y", f"{bounds['min'][1]:.2f}")
+                                        st.metric("Min Z", f"{bounds['min'][2]:.2f}")
+                                    with col_max:
+                                        st.metric("Max X", f"{bounds['max'][0]:.2f}")
+                                        st.metric("Max Y", f"{bounds['max'][1]:.2f}")
+                                        st.metric("Max Z", f"{bounds['max'][2]:.2f}")
+                        else:
+                            info_placeholder.error(f"✗ Failed: {result.get('error', 'Unknown error')}")
 
                     except Exception as e:
                         info_placeholder.error(f"✗ Error: {str(e)}")
