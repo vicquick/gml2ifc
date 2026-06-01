@@ -1497,7 +1497,7 @@ with tab4:
         )
 
         if uploaded_geojson:
-            geojson_bytes = uploaded_geojson.read()
+            geojson_bytes = uploaded_geojson.getvalue()
 
             @st.cache_data(show_spinner="Parsing tile index...")
             def _parse_index(data: bytes):
@@ -1773,7 +1773,7 @@ with tab4:
         )
 
         if uploaded_geojson_gml:
-            geojson_bytes_gml = uploaded_geojson_gml.read()
+            geojson_bytes_gml = uploaded_geojson_gml.getvalue()
 
             @st.cache_data(show_spinner="Parsing tile index...")
             def _parse_gml_index(data: bytes):

@@ -30,7 +30,9 @@ def parse_tile_index(geojson_bytes):
     index = {}
     for feat in data.get('features', []):
         props = feat.get('properties', {})
-        kachel = str(props.get('kachel', '')).strip()
+        # Support both DGM1 ('kachel'/'link_data') and LoD2 ('id'/'data_link') schemas
+        kachel = str(props.get('kachel') or props.get('id') or '').strip()
+        link_data = props.get('link_data') or props.get('data_link') or ''
         if len(kachel) == 9 and kachel.isdigit():
             zone = int(kachel[:2])
             x_km = int(kachel[2:5])
@@ -40,7 +42,7 @@ def parse_tile_index(geojson_bytes):
                 'x_km': x_km,
                 'y_km': y_km,
                 'datum': props.get('datum', ''),
-                'link_data': props.get('link_data', ''),
+                'link_data': link_data,
             }
     return index
 
